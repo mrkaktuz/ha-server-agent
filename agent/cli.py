@@ -1,19 +1,22 @@
 #!/usr/bin/python3
-"""dim-agent — адміністрування агента на сервері (запускати через sudo).
+"""ha-server-agent — адміністрування агента на сервері (запускати через sudo).
 
-  dim-agent show-key                    публічний ключ агента (вставити в Home Assistant)
-  dim-agent add-client NAME PUBKEY      дозволити клієнта (ключ показує Home Assistant)
-  dim-agent remove-client NAME          прибрати клієнта
-  dim-agent clients                     список клієнтів
-  dim-agent allow-ip IP[/MASK] ...      дозволені адреси клієнтів (порожньо — будь-які)
-  dim-agent detect [--write [--force]]  що знайдено на сервері / записати policy.yaml
-  dim-agent test                        самоперевірка: підписаний запит до локального агента
-  dim-agent status                      стан сервісу й короткий підсумок
+  ha-server-agent pair [--hours N]          новий код підключення для Home Assistant (діє N год, типово 24)
+  ha-server-agent clients                   хто підключений
+  ha-server-agent remove-client NAME        відключити клієнта
+  ha-server-agent add-client NAME PUBKEY    додати клієнта вручну (без коду підключення)
+  ha-server-agent allow-ip IP[/MASK] ...    дозволені адреси клієнтів (без аргументів — будь-які)
+  ha-server-agent detect [--write --force]  що знайдено на сервері / перезаписати policy.yaml
+  ha-server-agent test                      самоперевірка: підписаний запит до локального агента
+  ha-server-agent status                    стан сервісу й підсумок
 """
 
+import grp
 import json
 import os
+import pwd
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -22,18 +25,22 @@ import urllib.request
 
 import yaml
 
-sys.path.insert(0, "/usr/local/lib/dim-agent")
+sys.path.insert(0, "/usr/local/lib/ha-server-agent")
 import protocol as P  # noqa: E402
 
-ETC = "/etc/dim-agent"
+ETC = "/etc/ha-server-agent"
 CONFIG = ETC + "/agent.yaml"
 KEY = ETC + "/agent.key"
-HELPER = "/usr/local/lib/dim-agent/dim-agent-helper"
+STATE = ETC + "/state"
+CLIENTS = STATE + "/clients.yaml"
+PAIRING = STATE + "/pairing.json"
+HELPER = "/usr/local/lib/ha-server-agent/ha-server-agent-helper"
+USER = "ha-agent"
 
 
 def need_root():
     if os.geteuid() != 0:
-        sys.exit("запусти через sudo")
+        sys.exit("Запусти через sudo")
 
 
 def load_cfg():
@@ -44,43 +51,84 @@ def load_cfg():
 def save_cfg(cfg):
     tmp = CONFIG + ".tmp"
     with open(tmp, "w") as f:
-        f.write("# Налаштування мережевого шару dim-agent. Клієнтів додавати: sudo dim-agent add-client\n")
+        f.write("# Налаштування мережевого шару ha-server-agent (див. README)\n")
         yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
     os.chmod(tmp, 0o640)
-    os.chown(tmp, 0, _gid())
+    os.chown(tmp, 0, grp.getgrnam(USER).gr_gid)
     os.replace(tmp, CONFIG)
 
 
-def _gid():
-    import grp
-    return grp.getgrnam("dim-agent").gr_gid
+def owned_by_agent(path):
+    pw = pwd.getpwnam(USER)
+    os.chown(path, pw.pw_uid, pw.pw_gid)
+    os.chmod(path, 0o600)
 
 
-def show_key():
-    print(P.public_of(open(KEY).read().strip()))
+def load_clients():
+    try:
+        with open(CLIENTS) as f:
+            return (yaml.safe_load(f) or {}).get("clients") or []
+    except FileNotFoundError:
+        return []
 
 
-def add_client(name, key):
-    P.load_public(key)  # перевірка формату
+def save_clients(cl):
+    with open(CLIENTS, "w") as f:
+        f.write("# Клієнти агента (публічні ключі)\n")
+        yaml.safe_dump({"clients": cl}, f, allow_unicode=True, sort_keys=False)
+    owned_by_agent(CLIENTS)
+
+
+def agent_url(cfg):
+    if cfg.get("public_url"):
+        return cfg["public_url"]
+    scheme = "https" if (cfg.get("tls") or {}).get("cert") else "http"
+    return f"{scheme}://{cfg.get('listen', '127.0.0.1')}:{cfg.get('port', 8787)}"
+
+
+def fingerprint(cfg):
+    """Відбиток сертифіката для закріплення в HA: власний TLS агента або не довірений сертифікат nginx."""
+    cert = (cfg.get("tls") or {}).get("cert") or cfg.get("pin_cert")
+    if not cert:
+        return ""
+    pem = open(cert).read()
+    pem = pem.split("-----END CERTIFICATE-----")[0] + "-----END CERTIFICATE-----\n"  # перший (листовий)
+    der = ssl.PEM_cert_to_DER_cert(pem)
+    import hashlib
+    return hashlib.sha256(der).hexdigest()
+
+
+def pair(hours=24):
     cfg = load_cfg()
-    cl = [c for c in cfg.get("clients") or [] if c.get("name") != name]
-    cl.append({"name": name, "key": key.strip()})
-    cfg["clients"] = cl
-    save_cfg(cfg)
-    print(f"Клієнта «{name}» додано (ключ {P.key_id(key)}). Агент перечитає налаштування сам.")
-
-
-def remove_client(name):
-    cfg = load_cfg()
-    before = len(cfg.get("clients") or [])
-    cfg["clients"] = [c for c in cfg.get("clients") or [] if c.get("name") != name]
-    save_cfg(cfg)
-    print("Прибрано." if len(cfg["clients"]) < before else "Такого клієнта немає.")
+    secret = P.new_secret()
+    with open(PAIRING, "w") as f:
+        json.dump({"secret": secret, "expires": time.time() + hours * 3600}, f)
+    owned_by_agent(PAIRING)
+    code = P.make_code(agent_url(cfg), P.public_of(open(KEY).read().strip()), secret, fingerprint(cfg), socket.gethostname())
+    print("Код підключення (діє %d год, одноразовий):\n\n%s\n" % (hours, code))
+    print("Home Assistant → Налаштування → Пристрої та служби → Додати інтеграцію → HA Server Agent → вставити код.")
 
 
 def clients():
-    for c in load_cfg().get("clients") or []:
-        print(f"{c.get('name'):24} {P.key_id(c['key'])}")
+    cl = load_clients()
+    if not cl:
+        print("Клієнтів немає. Код підключення: sudo ha-server-agent pair")
+    for c in cl:
+        print(f"{c.get('name'):24} {P.key_id(c['key'])}  {c.get('added', '')}")
+
+
+def add_client(name, key):
+    P.load_public(key)
+    cl = [c for c in load_clients() if c.get("name") != name] + [{"name": name, "key": key.strip(), "added": time.strftime("%Y-%m-%d %H:%M")}]
+    save_clients(cl)
+    print(f"Клієнта «{name}» додано ({P.key_id(key)}).")
+
+
+def remove_client(name):
+    cl = load_clients()
+    rest = [c for c in cl if c.get("name") != name]
+    save_clients(rest)
+    print("Прибрано." if len(rest) < len(cl) else "Такого клієнта немає.")
 
 
 def allow_ip(ips):
@@ -93,26 +141,32 @@ def allow_ip(ips):
     print("allow_ips:", ips or "будь-які")
 
 
+def local_request(cfg, path, headers=None):
+    scheme = "https" if (cfg.get("tls") or {}).get("cert") else "http"
+    host = "127.0.0.1" if cfg.get("listen", "127.0.0.1") in ("0.0.0.0", "127.0.0.1") else cfg["listen"]
+    ctx = ssl._create_unverified_context() if scheme == "https" else None  # свій сертифікат, перевіряємо підпис
+    req = urllib.request.Request(f"{scheme}://{host}:{cfg.get('port', 8787)}{path}", headers=headers or {})
+    return urllib.request.urlopen(req, timeout=60, context=ctx)
+
+
 def selftest():
-    """Тимчасовий клієнт → підписаний /v1/ping і /v1/state → перевірка підпису відповіді → клієнта прибрати."""
+    """Тимчасовий клієнт → підписані /v1/ping і /v1/state → перевірка підпису відповіді → клієнта прибрати."""
     priv_b64, pub_b64 = P.generate_keypair()
     priv = P.load_private(priv_b64)
     agent_pub = P.load_public(P.public_of(open(KEY).read().strip()))
     cfg = load_cfg()
-    saved = cfg.get("clients")
-    cfg["clients"] = (saved or []) + [{"name": "selftest", "key": pub_b64}]
-    save_cfg(cfg)
+    saved = load_clients()
+    save_clients(saved + [{"name": "selftest", "key": pub_b64}])
+    ok_all = True
     try:
-        time.sleep(0.2)
-        url = f"http://{cfg.get('listen', '127.0.0.1')}:{cfg.get('port', 8787)}"
+        time.sleep(0.3)
         for path in ("/v1/ping", "/v1/state"):
             ts, nonce = str(int(time.time())), P.new_nonce()
-            req = urllib.request.Request(url + path, headers={
-                P.H_KEY: P.key_id(pub_b64), P.H_TIME: ts, P.H_NONCE: nonce,
-                P.H_SIG: P.sign(priv, P.req_message("GET", path, ts, nonce, b""))})
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with local_request(cfg, path, {P.H_KEY: P.key_id(pub_b64), P.H_TIME: ts, P.H_NONCE: nonce,
+                                           P.H_SIG: P.sign(priv, P.req_message("GET", path, ts, nonce, b""))}) as r:
                 body = r.read()
                 ok = P.verify(agent_pub, P.resp_message(r.status, nonce, r.headers[P.H_TIME], body), r.headers[P.H_SIG])
+            ok_all &= ok
             data = json.loads(body)
             if path == "/v1/ping":
                 print(f"ping: {'OK' if ok else 'ПІДПИС ВІДПОВІДІ НЕДІЙСНИЙ'} — {data.get('hostname')} v{data.get('version')}")
@@ -120,24 +174,25 @@ def selftest():
                 mods = data.get("modules", {})
                 print("state: " + ("OK" if ok else "ПІДПИС НЕДІЙСНИЙ") + " — модулі: " + ", ".join(
                     f"{k}{'(помилка)' if v.get('error') else ''}" for k, v in mods.items()))
-        # Без підпису — має бути 401
+                for k, v in mods.items():
+                    if v.get("needs_secret"):
+                        ns = v["needs_secret"]
+                        print(f"  ! {ns['what']}: додай у {ns['file']} рядок «{ns['key']}: \"…\"» (HA теж нагадає)")
         try:
-            urllib.request.urlopen(url + "/v1/state", timeout=10)
+            local_request(cfg, "/v1/state")
             print("УВАГА: запит без підпису пройшов!")
+            ok_all = False
         except urllib.error.HTTPError as e:
             print(f"без підпису: {e.code} (так і має бути)")
     finally:
-        cfg = load_cfg()
-        cfg["clients"] = [c for c in cfg.get("clients") or [] if c.get("name") != "selftest"]
-        save_cfg(cfg)
+        save_clients(saved)
+    return ok_all
 
 
 def status():
-    subprocess.run(["systemctl", "--no-pager", "status", "dim-agent", "-n", "5"])
+    subprocess.run(["systemctl", "--no-pager", "status", "ha-server-agent", "-n", "5"])
     cfg = load_cfg()
-    print(f"\nклієнтів: {len(cfg.get('clients') or [])}, allow_ips: {cfg.get('allow_ips') or 'будь-які'}, "
-          f"слухає {cfg.get('listen', '127.0.0.1')}:{cfg.get('port', 8787)}")
-    print("публічний ключ агента:", P.public_of(open(KEY).read().strip()))
+    print(f"\nадреса для HA: {agent_url(cfg)}, клієнтів: {len(load_clients())}, allow_ips: {cfg.get('allow_ips') or 'будь-які'}")
 
 
 def main():
@@ -147,20 +202,20 @@ def main():
         print(__doc__)
         return
     c = a[0]
-    if c == "show-key":
-        show_key()
+    if c == "pair":
+        pair(int(a[a.index("--hours") + 1]) if "--hours" in a else 24)
+    elif c == "clients":
+        clients()
     elif c == "add-client" and len(a) == 3:
         add_client(a[1], a[2])
     elif c == "remove-client" and len(a) == 2:
         remove_client(a[1])
-    elif c == "clients":
-        clients()
     elif c == "allow-ip":
         allow_ip(a[1:])
     elif c == "detect":
         os.execv(HELPER, [HELPER, "detect"] + a[1:])
     elif c == "test":
-        selftest()
+        sys.exit(0 if selftest() else 1)
     elif c == "status":
         status()
     else:

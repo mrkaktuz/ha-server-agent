@@ -1,6 +1,6 @@
-"""Перевірка API агента ззовні: підписані запити, дії, відмови, повтор nonce, підробка підпису.
+"""Перевірка API агента ззовні (свій сертифікат агента не перевіряємо — справжність дає підпис відповіді): підписані запити, дії, відмови, повтор nonce, підробка підпису.
 python3 test/client.py URL AGENT_PUBKEY CLIENT_PRIVKEY"""
-import json, sys, time, urllib.request, urllib.error
+import json, ssl, sys, time, urllib.request, urllib.error
 sys.path.insert(0, __file__.rsplit('/', 2)[0] + '/agent')
 import protocol as P
 
@@ -16,7 +16,7 @@ def call(method, path, payload=None, tamper=None, nonce=None, ts=None):
     req = urllib.request.Request(url + path, data=body or None, method=method, headers={
         P.H_KEY: kid, P.H_TIME: ts, P.H_NONCE: nonce, P.H_SIG: sig, "Content-Type": "application/json"})
     try:
-        r = urllib.request.urlopen(req, timeout=60); status, raw, hd = r.status, r.read(), r.headers
+        r = urllib.request.urlopen(req, timeout=60, context=ssl._create_unverified_context()); status, raw, hd = r.status, r.read(), r.headers
     except urllib.error.HTTPError as e:
         status, raw, hd = e.code, e.read(), e.headers
     ok = bool(hd.get(P.H_SIG)) and P.verify(agent_pub, P.resp_message(status, nonce, hd.get(P.H_TIME, ""), raw), hd.get(P.H_SIG, ""))

@@ -19,7 +19,7 @@ class AgentEntity(CoordinatorEntity[AgentCoordinator]):
         self._attr_name = name
         data = coord.data or {}
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, entry.entry_id)}, name=entry.title, manufacturer="Dim Server Agent",
+            identifiers={(DOMAIN, entry.entry_id)}, name=entry.title, manufacturer="HA Server Agent",
             model=((data.get("modules") or {}).get("system") or {}).get("os"), sw_version=data.get("version"))
 
     @property

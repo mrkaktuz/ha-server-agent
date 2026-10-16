@@ -1,0 +1,11 @@
+{
+  "domain": "ha_server_agent",
+  "name": "HA Server Agent",
+  "codeowners": ["@mrkaktuz"],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/mrkaktuz/ha-server-agent",
+  "iot_class": "cloud_polling",
+  "requirements": [],
+  "version": "0.2.0"
+}

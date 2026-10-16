@@ -1,11 +1,11 @@
 #!/usr/bin/python3
-"""Dim Server Agent — привілейований помічник (працює від root через sudo).
+"""HA Server Agent — привілейований помічник (працює від root через sudo).
 
 Агент (непривілейований) викликає лише три команди:
   helper collect          — зібрати стан усіх увімкнених модулів (JSON у stdout)
   helper action           — виконати дію; запит JSON у stdin: {"module", "target", "action"}
   helper detect           — знайти, що є на сервері, і вивести пропозицію політики (YAML)
-Що дозволено — лише з /etc/dim-agent/policy.yaml (власник root). Жодних довільних команд:
+Що дозволено — лише з /etc/ha-server-agent/policy.yaml (власник root). Жодних довільних команд:
 кожна дія — фіксований argv без оболонки, ціль перевіряється за поточним станом.
 """
 
@@ -24,10 +24,10 @@ import urllib.request
 
 import yaml
 
-ETC = "/etc/dim-agent"
+ETC = "/etc/ha-server-agent"
 POLICY = ETC + "/policy.yaml"
 SECRETS = ETC + "/secrets.yaml"
-CACHE = "/var/cache/dim-agent"
+CACHE = "/var/cache/ha-server-agent"
 ENV = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
 OUT_LIMIT = 4000
 
@@ -142,7 +142,7 @@ def collect_system(cfg, sec):
 # --------------------------------------------------------------------------- systemd
 
 SYSTEMD_ACTIONS = {"start", "stop", "restart", "reload"}
-ALWAYS_PROTECTED = {"ssh.service", "sshd.service", "dim-agent.service", "systemd-journald.service", "dbus.service"}
+ALWAYS_PROTECTED = {"ssh.service", "sshd.service", "ha-server-agent.service", "systemd-journald.service", "dbus.service"}
 
 
 def systemd_units(cfg):
@@ -381,11 +381,18 @@ def dup_backups(cfg, sec):
 
 def collect_duplicati(cfg, sec):
     acts = [a for a in (cfg.get("actions") or ["run"]) if a == "run"]
+    need = {"key": "duplicati_password", "file": SECRETS, "what": "пароль вебінтерфейсу Duplicati"}
     try:
         return {"available": True, "backups": dup_backups(cfg, sec), "actions": acts}
     except urllib.error.HTTPError as e:
-        hint = " (потрібен пароль у secrets.yaml: duplicati_password)" if e.code in (401, 403) else ""
-        return {"available": False, "error": f"HTTP {e.code}{hint}"}
+        if e.code in (401, 403):
+            # Вебінтерфейс захищено паролем: або його немає в secrets.yaml, або він неправильний
+            if sec.get("duplicati_password"):
+                return {"available": False, "error": "пароль Duplicati не підходить", "needs_secret": dict(need, wrong=True)}
+            return {"available": False, "error": "потрібен пароль Duplicati", "needs_secret": need}
+        return {"available": False, "error": f"HTTP {e.code}"}
+    except urllib.error.URLError as e:
+        return {"available": False, "error": f"вебінтерфейс Duplicati недоступний ({cfg.get('url') or 'http://127.0.0.1:8200'}): {e.reason}"[:200]}
     except Exception as e:  # noqa: BLE001
         return {"available": False, "error": str(e)[:200]}
 
@@ -588,7 +595,7 @@ def detect():
         n = os.path.basename(p)
         if os.path.islink(p) and os.readlink(p) == "/dev/null":
             continue
-        if n not in units and n != "dim-agent.service" and files.get(n) == "enabled":
+        if n not in units and n != "ha-server-agent.service" and files.get(n) == "enabled":
             units[n] = ["start", "stop", "restart"]
 
     # pm2: демони «PM2 vX: God Daemon (/home/u/.pm2)»
@@ -624,6 +631,12 @@ def detect():
     if has_docker:
         rc, dout, _ = run(["docker", "ps", "-a", "--format", "{{.Names}}\t{{.Image}}"])
         dup_docker = next((l.split("\t")[0] for l in dout.splitlines() if "duplicati" in l.lower()), None)
+    dup_url = "http://127.0.0.1:8200"
+    if dup_docker:  # порт вебінтерфейсу, проброшений з контейнера
+        rc, pout, _ = run(["docker", "port", dup_docker, "8200/tcp"])
+        m = re.search(r":(\d+)\s*$", pout.splitlines()[0]) if pout.strip() else None
+        if m:
+            dup_url = f"http://127.0.0.1:{m.group(1)}"
 
     policy = {
         "system": {"enabled": True},
@@ -631,7 +644,7 @@ def detect():
         "pm2": {"enabled": bool(pm2), "instances": pm2, "actions": ["start", "stop", "restart", "reload"], "save_after_action": True},
         "nginx": {"enabled": bool(shutil.which("nginx", path=ENV["PATH"])), "actions": ["test", "reload", "restart"]},
         "certs": {"enabled": True, "warn_days": 14, "extra_paths": []},
-        "duplicati": {"enabled": bool(dup_unit or dup_docker), "url": "http://127.0.0.1:8200", "actions": ["run"]},
+        "duplicati": {"enabled": bool(dup_unit or dup_docker), "url": dup_url, "actions": ["run"]},
         "tmux": {"enabled": bool(tmux), "users": tmux, "allow_kill": False},
         "docker": {"enabled": has_docker, "actions": ["start", "stop", "restart"], "containers": []},
         "fail2ban": {"enabled": bool(shutil.which("fail2ban-client", path=ENV["PATH"]))},
@@ -642,8 +655,8 @@ def detect():
     return policy, found
 
 
-HEADER = """# Політика Dim Server Agent: що агент бачить і чим може керувати.
-# Створено автовиявленням (dim-agent detect). Правити вручну; після правки — нічого перезапускати не треба.
+HEADER = """# Політика HA Server Agent: що агент бачить і чим може керувати.
+# Створено автовиявленням (ha-server-agent detect). Правити вручну; після правки — нічого перезапускати не треба.
 # Дії, яких тут немає, агент не виконає навіть за правильно підписаним запитом.
 """
 

@@ -1,7 +1,7 @@
-"""Dim Server Agent: стан застосунків сервера (pm2, systemd, nginx, Duplicati, tmux, Docker…) і керування ними.
+"""HA Server Agent: стан застосунків сервера (pm2, systemd, nginx, Duplicati, tmux, Docker…) і керування ними.
 
 Кожен сервер — окремий запис інтеграції. Дані — з агента на сервері (підписані запити Ed25519).
-Сервіс dim_server_agent.action виконує дозволену політикою агента дію й повертає результат.
+Сервіс ha_server_agent.action виконує дозволену політикою агента дію й повертає результат.
 """
 
 from __future__ import annotations

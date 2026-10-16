@@ -1,0 +1,57 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Сервер з HA Server Agent",
+        "description": "Встановлювач агента наприкінці показує код підключення (новий: `sudo ha-server-agent pair` на сервері). Вставте його сюди — Home Assistant сам сполучиться з агентом.",
+        "data": {
+          "name": "Назва сервера",
+          "code": "Код підключення"
+        }
+      }
+    },
+    "error": {
+      "bad_code": "Це не код підключення (має починатися з HSA1:)",
+      "pair_refused": "Агент не прийняв код: він уже використаний, застарів (sudo ha-server-agent pair — новий) або твоя IP не дозволена",
+      "bad_identity": "Відповідає не той сервер, що в коді (сертифікат або ключ не збігаються)",
+      "cannot_connect": "Немає зв'язку з агентом (адреса, порт, фаєрвол?)"
+    },
+    "abort": {
+      "already_configured": "Цей сервер уже додано"
+    }
+  },
+  "issues": {
+    "needs_secret": {
+      "title": "{server}: потрібен {what}",
+      "description": "Агент на сервері «{server}» не може прочитати дані: потрібен {what}.\n\nНа сервері відкрий `{file}` (`sudo nano {file}`) і додай рядок:\n\n`{key}: \"…\"`\n\nПерезапуск не потрібен — нагадування зникне за хвилину."
+    },
+    "wrong_secret": {
+      "title": "{server}: {what} не підходить",
+      "description": "Агент на сервері «{server}» спробував {what} з `{file}` (`{key}`), але він не підійшов. Виправ значення — нагадування зникне за хвилину."
+    }
+  },
+  "services": {
+    "action": {
+      "name": "Дія на сервері",
+      "description": "Виконати дозволену політикою агента дію (перезапуск pm2-процесу, сервісу, nginx reload, запуск копії Duplicati…).",
+      "fields": {
+        "server": {
+          "name": "Сервер",
+          "description": "Запис інтеграції"
+        },
+        "module": {
+          "name": "Модуль",
+          "description": "systemd, pm2, nginx, duplicati, tmux, docker"
+        },
+        "target": {
+          "name": "Ціль",
+          "description": "Сервіс (nginx.service), pm2 — користувач/назва (deploy/api), контейнер, ID копії, tmux — користувач/сесія"
+        },
+        "action": {
+          "name": "Дія",
+          "description": "start, stop, restart, reload, test, run, kill"
+        }
+      }
+    }
+  }
+}

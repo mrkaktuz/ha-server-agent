@@ -1,18 +1,25 @@
-"""Протокол Dim Server Agent (DSA1): підписи запитів і відповідей ключами Ed25519.
+"""Протокол HA Server Agent (HSA1): підписи запитів і відповідей ключами Ed25519, сполучення, код підключення.
 
-Запит (клієнт → агент) несе заголовки:
-  X-DSA-Key    — ідентифікатор ключа клієнта (перші 16 hex від SHA-256 публічного ключа)
-  X-DSA-Time   — час клієнта, unix-секунди
-  X-DSA-Nonce  — одноразове випадкове значення (32 hex)
-  X-DSA-Sig    — base64-підпис рядка req_message(...)
-Відповідь (агент → клієнт) несе X-DSA-Time і X-DSA-Sig — підпис resp_message(...), прив'язаний
-до nonce запиту, тож перехоплену відповідь не можна підсунути на інший запит.
+Запит (клієнт → агент):
+  X-HSA-Key    — ідентифікатор ключа клієнта (перші 16 hex від SHA-256 публічного ключа)
+  X-HSA-Time   — час клієнта, unix-секунди
+  X-HSA-Nonce  — одноразове випадкове значення (32 hex)
+  X-HSA-Sig    — base64-підпис req_message(...)
+Відповідь (агент → клієнт): X-HSA-Time і X-HSA-Sig — підпис resp_message(...), прив'язаний до nonce запиту.
 
-Цей файл без змін копіюється в інтеграцію Home Assistant (custom_components/dim_server_agent).
+Сполучення (POST /v1/pair): клієнт ще не відомий агенту, тож доводить право одноразовим секретом із коду
+підключення — HMAC-SHA256(secret, pair_message(...)). Агент додає його публічний ключ і знищує секрет.
+
+Код підключення — те, що встановлювач показує людині: «HSA1:» + base64url(JSON {u: адреса, k: ключ агента,
+f: SHA-256 сертифіката для закріплення або "", p: секрет сполучення, n: ім'я хоста}).
+
+Цей файл без змін копіюється в інтеграцію Home Assistant (custom_components/ha_server_agent).
 """
 
 import base64
 import hashlib
+import hmac
+import json
 import os
 import secrets
 
@@ -22,13 +29,13 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
-PROTOCOL = "DSA1"
+PROTOCOL = "HSA1"
 MAX_SKEW = 30  # секунд розбіжності годинників клієнта й агента
 
-H_KEY = "X-DSA-Key"
-H_TIME = "X-DSA-Time"
-H_NONCE = "X-DSA-Nonce"
-H_SIG = "X-DSA-Sig"
+H_KEY = "X-HSA-Key"
+H_TIME = "X-HSA-Time"
+H_NONCE = "X-HSA-Nonce"
+H_SIG = "X-HSA-Sig"
 
 
 def b64e(data: bytes) -> str:
@@ -51,11 +58,23 @@ def resp_message(status: int, nonce: str, ts: str, body: bytes) -> bytes:
     return "\n".join([PROTOCOL + "-RESP", str(status), nonce, ts, body_hash(body)]).encode()
 
 
+def pair_message(name: str, key: str, ts: str, nonce: str) -> bytes:
+    return "\n".join([PROTOCOL + "-PAIR", name, key, ts, nonce]).encode()
+
+
+def pair_mac(secret_b64: str, name: str, key: str, ts: str, nonce: str) -> str:
+    return hmac.new(b64d(secret_b64), pair_message(name, key, ts, nonce), hashlib.sha256).hexdigest()
+
+
 def new_nonce() -> str:
     return secrets.token_hex(16)
 
 
-# ---- Ключі: зберігаємо сирі 32 байти в base64 (один рядок — зручно копіювати)
+def new_secret() -> str:
+    return b64e(secrets.token_bytes(32))
+
+
+# ---- Ключі: сирі 32 байти в base64 (один рядок — зручно копіювати)
 
 def generate_keypair():
     """Повертає (private_b64, public_b64)."""
@@ -104,6 +123,29 @@ def verify(pub: Ed25519PublicKey, message: bytes, sig_b64: str) -> bool:
         return True
     except Exception:  # noqa: BLE001 — будь-яка помилка = підпис недійсний
         return False
+
+
+# ---- Код підключення
+
+CODE_PREFIX = PROTOCOL + ":"
+
+
+def make_code(url: str, agent_key: str, pair_secret: str, fingerprint: str = "", host: str = "") -> str:
+    data = json.dumps({"u": url, "k": agent_key, "f": fingerprint, "p": pair_secret, "n": host}, separators=(",", ":"))
+    return CODE_PREFIX + base64.urlsafe_b64encode(data.encode()).decode().rstrip("=")
+
+
+def parse_code(code: str) -> dict:
+    code = "".join(code.split())
+    if not code.startswith(CODE_PREFIX):
+        raise ValueError("код має починатися з " + CODE_PREFIX)
+    raw = code[len(CODE_PREFIX):]
+    data = json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
+    load_public(data["k"])
+    b64d(data["p"])
+    if not str(data.get("u", "")).startswith(("https://", "http://")):
+        raise ValueError("некоректна адреса в коді")
+    return data
 
 
 def write_secret_file(path: str, text: str, mode: int = 0o600) -> None:

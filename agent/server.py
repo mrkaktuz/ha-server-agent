@@ -1,22 +1,27 @@
 #!/usr/bin/python3
-"""Dim Server Agent — мережевий шар (працює від непривілейованого користувача dim-agent).
+"""HA Server Agent — мережевий шар (працює від непривілейованого користувача ha-agent).
 
-Слухає лише локальну адресу (типово 127.0.0.1:8787); назовні — через nginx/Cloudflare (https).
-Кожен запит має бути підписаний ключем клієнта з agent.yaml; перевірки по черзі:
-  IP у списку дозволених → відомий ключ → час у межах ±30 с → nonce ще не траплявся → підпис.
-Помилки автентифікації — однакова відповідь 401 без подробиць; після 10 невдач IP блокується на 15 хв.
-Відповіді підписуються ключем агента (клієнт перевіряє, що говорить саме з цим сервером).
-Дані й дії — через привілейований помічник (sudo helper collect|action), що звіряється з policy.yaml.
+Режими (agent.yaml):
+  • за nginx — слухає 127.0.0.1:8787; справжню адресу клієнта бере з X-Agent-Client-IP, який ставить
+    лише наш nginx (після обробки адрес Cloudflare), і тільки для запитів з 127.0.0.1;
+  • власний TLS — слухає 0.0.0.0:<порт> з сертифікатом із tls.cert / tls.key (HA закріплює його відбиток);
+  • локальний — 127.0.0.1 без TLS (Home Assistant на цій самій машині).
+Кожен запит підписаний ключем клієнта зі state/clients.yaml; перевірки по черзі:
+  IP у allow_ips → відомий ключ → час ±30 с → nonce ще не траплявся → підпис.
+Помилки автентифікації — однакова відповідь 401; після 10 невдач IP блокується на 15 хв.
+Відповіді підписані ключем агента. Дані й дії — через помічника (sudo helper collect|action) і policy.yaml.
 
-Ендпоінти: GET /v1/ping, GET /v1/state, POST /v1/action {"module","target","action"}.
+Ендпоінти: GET /v1/ping, GET /v1/state, POST /v1/action, POST /v1/pair (одноразовий секрет із коду підключення).
 """
 
+import hmac
 import http.server
 import ipaddress
 import json
 import logging
 import os
 import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -27,21 +32,43 @@ import yaml
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import protocol as P  # noqa: E402
 
-VERSION = "0.1.0"
-ETC = "/etc/dim-agent"
+VERSION = "0.2.0"
+ETC = "/etc/ha-server-agent"
 CONFIG = ETC + "/agent.yaml"
 KEY = ETC + "/agent.key"
-HELPER = "/usr/local/lib/dim-agent/dim-agent-helper"
-AUDIT = "/var/log/dim-agent/audit.log"
+STATE = ETC + "/state"
+CLIENTS = STATE + "/clients.yaml"
+PAIRING = STATE + "/pairing.json"
+HELPER = "/usr/local/lib/ha-server-agent/ha-server-agent-helper"
+AUDIT = "/var/log/ha-server-agent/audit.log"
+CLIENT_IP_HEADER = "X-Agent-Client-IP"
 MAX_BODY = 16 * 1024
 STATE_TTL = 15  # с — кешуємо зібраний стан, щоб часті запити не навантажували сервер
 
-log = logging.getLogger("dim-agent")
+log = logging.getLogger("ha-server-agent")
+
+
+def load_clients():
+    try:
+        with open(CLIENTS) as f:
+            return (yaml.safe_load(f) or {}).get("clients") or []
+    except FileNotFoundError:
+        return []
+
+
+def save_clients(clients):
+    tmp = CLIENTS + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write("# Клієнти агента (публічні ключі). Керувати: sudo ha-server-agent clients | add-client | remove-client\n")
+        yaml.safe_dump({"clients": clients}, f, allow_unicode=True, sort_keys=False)
+    os.replace(tmp, CLIENTS)
 
 
 class Agent:
     def __init__(self):
         self.lock = threading.Lock()
+        self.mtimes = None
         self.reload()
         self.nonces = {}        # nonce → час
         self.fails = {}         # ip → [час невдач]
@@ -50,28 +77,33 @@ class Agent:
         self.state_cache = (0.0, None)
         self.state_lock = threading.Lock()
 
+    def _mt(self, path):
+        try:
+            return os.path.getmtime(path)
+        except OSError:
+            return 0
+
     def reload(self):
         with open(CONFIG) as f:
-            cfg = yaml.safe_load(f) or {}
-        self.cfg = cfg
+            self.cfg = yaml.safe_load(f) or {}
         self.priv = P.load_private(open(KEY).read().strip())
         self.clients = {}
-        for c in cfg.get("clients") or []:
+        for c in load_clients():
             try:
                 self.clients[P.key_id(c["key"])] = (c.get("name") or "client", P.load_public(c["key"]))
             except Exception as e:  # noqa: BLE001
                 log.error("пропускаю клієнта %s: %s", c.get("name"), e)
-        self.allow = [ipaddress.ip_network(n, strict=False) for n in cfg.get("allow_ips") or []]
-        self.mtime = os.path.getmtime(CONFIG)
+        self.allow = [ipaddress.ip_network(n, strict=False) for n in self.cfg.get("allow_ips") or []]
+        self.mtimes = (self._mt(CONFIG), self._mt(CLIENTS))
 
     def maybe_reload(self):
-        try:
-            if os.path.getmtime(CONFIG) != self.mtime:
+        if (self._mt(CONFIG), self._mt(CLIENTS)) != self.mtimes:
+            try:
                 with self.lock:
                     self.reload()
-                log.info("agent.yaml перечитано: клієнтів %d", len(self.clients))
-        except Exception as e:  # noqa: BLE001
-            log.error("не вдалося перечитати agent.yaml: %s", e)
+                log.info("налаштування перечитано: клієнтів %d", len(self.clients))
+            except Exception as e:  # noqa: BLE001
+                log.error("не вдалося перечитати налаштування: %s", e)
 
     # ---- захист від перебору й повторів
 
@@ -132,12 +164,12 @@ def audit(line):
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
-    server_version = "dim-agent"
+    server_version = "ha-server-agent"
     sys_version = ""
     protocol_version = "HTTP/1.1"
     timeout = 20  # с на запит — повільні з'єднання не тримають потоки
 
-    def log_message(self, fmt, *args):  # пишемо самі, без зайвого
+    def log_message(self, fmt, *args):
         pass
 
     @property
@@ -146,10 +178,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def client_ip(self):
         peer = self.client_address[0]
-        hdr = self.agent.cfg.get("trusted_proxy_header", "CF-Connecting-IP")
-        # Заголовку проксі віримо лише тоді, коли запит прийшов з локальної машини (nginx)
-        if hdr and peer in ("127.0.0.1", "::1") and self.headers.get(hdr):
-            return self.headers.get(hdr).split(",")[0].strip()
+        if peer.startswith("::ffff:"):
+            peer = peer[7:]
+        # Заголовку віримо лише від нашого nginx на цій машині
+        if peer in ("127.0.0.1", "::1") and self.headers.get(CLIENT_IP_HEADER):
+            return self.headers.get(CLIENT_IP_HEADER).strip()
         return peer
 
     def send(self, status, obj, nonce=None):
@@ -171,8 +204,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.agent.note_fail(ip)
         self.send(status, {"error": "unauthorized" if status == 401 else why})
 
-    def authenticate(self, body):
-        """Повертає (ім'я клієнта, nonce) або None (відповідь уже надіслано)."""
+    def precheck(self):
+        """IP, блокування, частота. Повертає ip або None (відповідь уже надіслано)."""
         a = self.agent
         a.maybe_reload()
         ip = self.client_ip()
@@ -188,6 +221,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.deny(ip, "некоректна адреса")
         if a.allow and not any(ipobj in n for n in a.allow):
             return self.deny(ip, "IP не в allow_ips")
+        return ip
+
+    def authenticate(self, body):
+        """Повертає (ім'я клієнта, nonce) або None (відповідь уже надіслано)."""
+        ip = self.precheck()
+        if not ip:
+            return None
+        a = self.agent
         kid, ts, nonce, sig = (self.headers.get(h, "") for h in (P.H_KEY, P.H_TIME, P.H_NONCE, P.H_SIG))
         if kid not in a.clients:
             return self.deny(ip, "невідомий ключ")
@@ -231,6 +272,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = self.read_body()
         except ValueError:
             return self.send(413, {"error": "too large"})
+        if self.path == "/v1/pair":
+            return self.pair(body)
         auth = self.authenticate(body)
         if not auth:
             return
@@ -252,6 +295,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.agent.state_cache = (0.0, None)  # після дії — свіжий стан
         self.send(200 if res.get("ok") else (403 if res.get("denied") else 500), res, nonce)
 
+    def pair(self, body):
+        """Сполучення: клієнт доводить знання одноразового секрету з коду підключення (HMAC)."""
+        ip = self.precheck()
+        if not ip:
+            return
+        try:
+            req = json.loads(body or b"{}")
+            name, key, ts, nonce, mac = (str(req.get(k, "")) for k in ("name", "key", "ts", "nonce", "mac"))
+            P.load_public(key)
+        except Exception:  # noqa: BLE001
+            return self.deny(ip, "некоректний запит сполучення")
+        try:
+            with open(PAIRING) as f:
+                pr = json.load(f)
+        except (OSError, ValueError):
+            return self.deny(ip, "сполучення не очікується (sudo ha-server-agent pair)")
+        if time.time() > pr.get("expires", 0):
+            return self.deny(ip, "код підключення застарів (sudo ha-server-agent pair)")
+        if not ts.isdigit() or abs(time.time() - int(ts)) > P.MAX_SKEW or len(nonce) != 32:
+            return self.deny(ip, "час або nonce сполучення некоректні")
+        if not hmac.compare_digest(P.pair_mac(pr["secret"], name, key, ts, nonce), mac) or not self.agent.nonce_ok(nonce):
+            return self.deny(ip, "секрет сполучення невірний")
+        name = "".join(ch for ch in name if ch.isalnum() or ch in " -_.()")[:40] or "home-assistant"
+        with self.agent.lock:
+            cl = [c for c in load_clients() if c.get("key") != key]
+            cl.append({"name": name, "key": key, "added": time.strftime("%Y-%m-%d %H:%M")})
+            save_clients(cl)
+            try:
+                os.remove(PAIRING)  # секрет одноразовий
+            except OSError:
+                pass
+        self.agent.maybe_reload()
+        audit(f"сполучено клієнта «{name}» ({P.key_id(key)}) з {ip}")
+        self.send(200, {"ok": True, "version": VERSION, "hostname": socket.gethostname()}, nonce)
+
     def do_PUT(self):
         self.send(405, {"error": "method not allowed"})
 
@@ -266,10 +344,16 @@ def main():
     if ":" in host:
         cls.address_family = socket.AF_INET6
     srv = cls((host, port), Handler)
+    tls = agent.cfg.get("tls") or {}
+    if tls.get("cert"):
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(tls["cert"], tls["key"])
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True, do_handshake_on_connect=False)  # рукостискання — у потоці запиту
     srv.agent = agent
     srv.daemon_threads = True
-    log.info("dim-agent %s слухає %s:%d, клієнтів %d, allow_ips: %s", VERSION, host, port,
-             len(agent.clients), agent.cfg.get("allow_ips") or "будь-які")
+    log.info("ha-server-agent %s слухає %s:%d%s, клієнтів %d, allow_ips: %s", VERSION, host, port,
+             " (TLS)" if tls.get("cert") else "", len(agent.clients), agent.cfg.get("allow_ips") or "будь-які")
     srv.serve_forever()
 
 
