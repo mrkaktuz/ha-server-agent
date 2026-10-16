@@ -518,17 +518,106 @@ def collect_processes(cfg, sec):
     return {"top_cpu": top("pcpu"), "top_mem": top("rss")}
 
 
+
+# --------------------------------------------------------------------------- самооновлення агента з git
+
+SOURCE_FILE = ETC + "/source"  # тека з клоном репозиторію (записує install.sh)
+LIB = "/usr/local/lib/ha-server-agent"
+
+
+def agent_source():
+    try:
+        d = open(SOURCE_FILE).read().strip()
+    except OSError:
+        return None
+    return d if os.path.isdir(os.path.join(d, ".git")) else None
+
+
+def git(src, *args, timeout=60):
+    # Ключ розгортання (лише читання) задає core.sshCommand у самому клоні; root — власник клону
+    return run(["git", "-C", src] + list(args), timeout=timeout,
+               env={"HOME": "/root", "GIT_TERMINAL_PROMPT": "0"})
+
+
+def agent_version():
+    try:
+        m = re.search(r'^VERSION = "([^"]+)"', open(LIB + "/server.py").read(), re.M)
+        return m.group(1) if m else None
+    except OSError:
+        return None
+
+
+def collect_agent(cfg, sec):
+    src = agent_source()
+    out = {"version": agent_version(), "source": src, "allow_update": cfg.get("allow_update", True)}
+    if not src:
+        out["error_update"] = "агент встановлено не з git-клону — самооновлення недоступне"
+        return out
+    rc, head, _ = git(src, "rev-parse", "--short", "HEAD")
+    out["commit"] = head.strip() if rc == 0 else None
+
+    def remote():
+        rc, _, err = git(src, "fetch", "--quiet", "origin", timeout=90)
+        if rc != 0:
+            return {"error": tail(err, 300) or "git fetch не вдався"}
+        rc, ref, _ = git(src, "rev-parse", "--abbrev-ref", "origin/HEAD")
+        branch = ref.strip() if rc == 0 and ref.strip() else "origin/main"
+        rc, rhead, _ = git(src, "rev-parse", "--short", branch)
+        rc2, subj, _ = git(src, "log", "-1", "--format=%s", branch)
+        return {"remote_commit": rhead.strip(), "branch": branch, "remote_subject": subj.strip()[:200]}
+    r = cached("agent_remote", int(cfg.get("check_hours", 3)) * 3600, remote)
+    out.update(r)
+    if r.get("error"):
+        out["error_update"] = r.pop("error")
+    out["update_available"] = bool(out.get("remote_commit") and out.get("commit") and out["remote_commit"] != out["commit"])
+    return out
+
+
+def act_agent(cfg, target, action):
+    if action == "check":
+        drop_cache("agent_remote")
+        return {"ok": True, "output": "Перевіряю оновлення"}
+    if action != "update" or not cfg.get("allow_update", True):
+        raise Denied("agent: дія не дозволена")
+    src = agent_source()
+    if not src:
+        raise Denied("агент встановлено не з git-клону")
+    drop_cache("agent_remote")
+    script = (f"cd {src} && git fetch --quiet origin && "
+              f"git reset --quiet --hard $(git rev-parse --abbrev-ref origin/HEAD 2>/dev/null || echo origin/main) && "
+              f"bash ./install.sh --update")
+    log = "/var/log/ha-server-agent/update.log"
+    # Окремий unit systemd: перезапуск агента не обірве оновлення (помічник живе в його cgroup)
+    if shutil.which("systemd-run", path=ENV["PATH"]) and os.path.isdir("/run/systemd/system"):
+        argv = ["systemd-run", "--unit", f"ha-server-agent-update-{int(time.time())}", "--collect", "--quiet",
+                "--setenv=HOME=/root", "/bin/bash", "-c", f"({script}) > {log} 2>&1"]
+        rc, out, err = run(argv, timeout=30)
+        return {"ok": rc == 0, "output": "Оновлення запущено (журнал: " + log + ")" if rc == 0 else tail(err)}
+    subprocess.Popen(["/bin/bash", "-c", f"({script}) > {log} 2>&1"], env=dict(ENV, HOME="/root"), start_new_session=True)
+    return {"ok": True, "output": "Оновлення запущено (журнал: " + log + ")"}
+
+
 # --------------------------------------------------------------------------- диспетчер
 
 MODULES = {
     "system": collect_system, "systemd": collect_systemd, "pm2": collect_pm2, "nginx": collect_nginx,
     "certs": collect_certs, "duplicati": collect_duplicati, "tmux": collect_tmux, "docker": collect_docker,
-    "fail2ban": collect_fail2ban, "processes": collect_processes,
+    "fail2ban": collect_fail2ban, "processes": collect_processes, "agent": collect_agent,
 }
 
 
-def enabled(policy, name):
+DEFAULT_ON = {"agent"}  # модулі, що працюють і без секції в policy.yaml (старі встановлення)
+
+
+def module_cfg(policy, name):
     cfg = policy.get(name)
+    if cfg is None and name in DEFAULT_ON:
+        cfg = {}
+    return cfg
+
+
+def enabled(policy, name):
+    cfg = module_cfg(policy, name)
     return isinstance(cfg, dict) and cfg.get("enabled", True)
 
 
@@ -540,7 +629,7 @@ def cmd_collect():
             continue
         t0 = time.time()
         try:
-            out[name] = fn(policy[name], sec)
+            out[name] = fn(module_cfg(policy, name), sec)
         except Exception as e:  # noqa: BLE001 — один модуль не валить решту
             out[name] = {"error": f"{type(e).__name__}: {e}"[:300]}
         out[name]["_ms"] = int((time.time() - t0) * 1000)
@@ -552,7 +641,7 @@ def cmd_action(req):
     module, target, action = str(req.get("module", "")), str(req.get("target", "")), str(req.get("action", ""))
     if not enabled(policy, module) or len(target) > 200:
         raise Denied(f"модуль {module} вимкнено")
-    cfg = policy[module]
+    cfg = module_cfg(policy, module)
     if module == "systemd":
         res = act_systemd(cfg, target, action)
     elif module == "pm2":
@@ -565,6 +654,8 @@ def cmd_action(req):
         res = act_tmux(cfg, target, action)
     elif module == "docker":
         res = act_docker(cfg, target, action)
+    elif module == "agent":
+        res = act_agent(cfg, target, action)
     else:
         raise Denied(f"модуль {module} не має дій")
     return res
@@ -649,6 +740,7 @@ def detect():
         "docker": {"enabled": has_docker, "actions": ["start", "stop", "restart"], "containers": []},
         "fail2ban": {"enabled": bool(shutil.which("fail2ban-client", path=ENV["PATH"]))},
         "processes": {"enabled": True, "top": 5},
+        "agent": {"enabled": True, "allow_update": True, "check_hours": 3},
     }
     found = {"pm2": [i["user"] for i in pm2], "tmux": tmux, "duplicati": dup_unit or dup_docker,
              "systemd": list(units), "docker": has_docker}

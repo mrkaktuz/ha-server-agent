@@ -38,6 +38,7 @@ while [ $# -gt 0 ]; do
     --purge) PURGE=1; shift ;;
     --no-nginx) NO_NGINX=1; shift ;;      # не чіпати nginx, а слухати https самому (порт 2053)
     --public-url) PUBLIC_URL="$2"; shift 2 ;;  # для перевірок: інша адреса в коді підключення
+    --update) shift ;;                    # запуск із самооновлення (те саме, що повторне встановлення)
     --no-service) NO_SERVICE=1; shift ;;  # для перевірки в контейнері без systemd
     *) echo "Невідомий параметр: $1"; exit 2 ;;
   esac
@@ -63,6 +64,9 @@ if [ "$UNINSTALL" = 1 ]; then
   exit 0
 fi
 
+# Без systemd (контейнер тощо) сервісом не керуємо
+[ -d /run/systemd/system ] || NO_SERVICE=1
+
 # ---- Режим: перше встановлення вимагає --local або --domain + --allow-ip
 FIRST=0; [ -f "$ETC/agent.yaml" ] || FIRST=1
 if [ "$FIRST" = 1 ]; then
@@ -84,6 +88,7 @@ python3 -c "import cryptography" 2>/dev/null || missing="$missing python3-crypto
 python3 -c "import yaml" 2>/dev/null || missing="$missing python3-yaml"
 command -v openssl >/dev/null || missing="$missing openssl"
 command -v sudo >/dev/null || missing="$missing sudo"
+command -v git >/dev/null || missing="$missing git"
 if [ -n "$missing" ]; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $missing >/dev/null; fi
 echo "ok"
 
@@ -109,6 +114,13 @@ install -d -o root -g $USR -m 750 "$ETC"
 install -d -o $USR -g $USR -m 700 "$ETC/state"
 install -d -o $USR -g $USR -m 750 "$LOG"
 install -d -o root -g root -m 700 "$CACHE"
+# Звідки оновлюватися: цей git-клон (агент сам перевіряє GitHub і ставить новий код за кнопкою в HA)
+if [ -d "$HERE/.git" ]; then
+  echo "$HERE" > "$ETC/source"; chmod 644 "$ETC/source"
+  git config --global --get-all safe.directory 2>/dev/null | grep -qx "$HERE" || git config --global --add safe.directory "$HERE"
+else
+  rm -f "$ETC/source"
+fi
 echo "ok"
 
 if [ ! -f "$ETC/agent.key" ]; then

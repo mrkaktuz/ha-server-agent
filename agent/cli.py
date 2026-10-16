@@ -8,6 +8,7 @@
   ha-server-agent allow-ip IP[/MASK] ...    дозволені адреси клієнтів (без аргументів — будь-які)
   ha-server-agent detect [--write --force]  що знайдено на сервері / перезаписати policy.yaml
   ha-server-agent test                      самоперевірка: підписаний запит до локального агента
+  ha-server-agent update                    оновити агента з git (те саме робить кнопка «Встановити» в HA)
   ha-server-agent status                    стан сервісу й підсумок
 """
 
@@ -216,6 +217,10 @@ def main():
         os.execv(HELPER, [HELPER, "detect"] + a[1:])
     elif c == "test":
         sys.exit(0 if selftest() else 1)
+    elif c == "update":
+        p = subprocess.run([HELPER, "action"], input=json.dumps({"module": "agent", "target": "", "action": "update"}),
+                           capture_output=True, text=True)
+        print(json.loads(p.stdout or "{}").get("output") or p.stderr)
     elif c == "status":
         status()
     else:

@@ -18,7 +18,7 @@ from .api import AgentError
 from .const import DOMAIN
 from .coordinator import AgentCoordinator
 
-PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR]
+PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.UPDATE]
 
 ACTION_SCHEMA = vol.Schema({
     vol.Required("server"): cv.string,
