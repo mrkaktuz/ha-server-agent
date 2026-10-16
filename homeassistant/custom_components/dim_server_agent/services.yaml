@@ -1,0 +1,22 @@
+action:
+  fields:
+    server:
+      required: true
+      selector:
+        config_entry:
+          integration: dim_server_agent
+    module:
+      required: true
+      example: pm2
+      selector:
+        select:
+          options: [systemd, pm2, nginx, duplicati, tmux, docker]
+    target:
+      example: deploy/api
+      selector:
+        text:
+    action:
+      required: true
+      example: restart
+      selector:
+        text:

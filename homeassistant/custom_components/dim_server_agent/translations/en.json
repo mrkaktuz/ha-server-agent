@@ -1,0 +1,53 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Сервер з Dim Server Agent",
+        "description": "Агент показує свій ключ після встановлення (`sudo dim-agent show-key`). Адреса — без шляху, напр. https://agent.example.com",
+        "data": {
+          "name": "Назва сервера",
+          "url": "Адреса агента",
+          "agent_key": "Публічний ключ агента"
+        }
+      },
+      "authorize": {
+        "title": "Дозволь Home Assistant на сервері",
+        "description": "Home Assistant створив свій ключ для «{name}». Виконай на сервері:\n\n`sudo dim-agent add-client home-assistant {client_key}`\n\nі натисни «Надіслати»."
+      }
+    },
+    "error": {
+      "bad_url": "Адреса має починатися з https://",
+      "bad_key": "Це не публічний ключ агента (base64, 32 байти)",
+      "not_authorized": "Агент ще не прийняв ключ (виконай add-client) або твоя IP не в allow_ips",
+      "bad_agent_key": "Відповідь підписана не тим ключем — перевір ключ агента",
+      "cannot_connect": "Немає зв'язку з агентом"
+    },
+    "abort": {
+      "already_configured": "Цей сервер уже додано"
+    }
+  },
+  "services": {
+    "action": {
+      "name": "Дія на сервері",
+      "description": "Виконати дозволену політикою агента дію (перезапуск pm2-процесу, сервісу, nginx reload, запуск копії Duplicati…).",
+      "fields": {
+        "server": {
+          "name": "Сервер",
+          "description": "Запис інтеграції"
+        },
+        "module": {
+          "name": "Модуль",
+          "description": "systemd, pm2, nginx, duplicati, tmux, docker"
+        },
+        "target": {
+          "name": "Ціль",
+          "description": "Сервіс (nginx.service), pm2 — користувач/назва (deploy/api), контейнер, ID копії, tmux — користувач/сесія"
+        },
+        "action": {
+          "name": "Дія",
+          "description": "start, stop, restart, reload, test, run, kill"
+        }
+      }
+    }
+  }
+}
