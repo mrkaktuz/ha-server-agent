@@ -34,6 +34,8 @@ def problems(mods: dict) -> list[str]:
         out.append(f"nginx: {ng.get('active')}")
     c = mods.get("certs") or {}
     for cert in c.get("certs") or []:
+        if not cert.get("used", True):
+            continue  # лежить у Let's Encrypt, але nginx його не віддає — не проблема
         if cert.get("days_left") is not None and cert["days_left"] < (c.get("warn_days") or 14):
             out.append(f"сертифікат {cert.get('subject') or cert.get('path')}: {cert['days_left']} дн")
     d = mods.get("duplicati") or {}

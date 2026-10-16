@@ -205,6 +205,9 @@ chown root:root "$ETC/secrets.yaml"; chmod 600 "$ETC/secrets.yaml"
 if [ ! -f "$ETC/policy.yaml" ]; then
   say "Автовиявлення (що є на сервері)"
   "$LIB/$NAME-helper" detect --write >/dev/null
+else
+  say "Автовиявлення: доповнення політики"
+  echo "  $("$LIB/$NAME-helper" detect --merge)"
 fi
 chown root:root "$ETC/policy.yaml"; chmod 644 "$ETC/policy.yaml"
 "$LIB/$NAME-helper" detect --summary | python3 -c '

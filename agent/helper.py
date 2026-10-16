@@ -28,7 +28,7 @@ ETC = "/etc/ha-server-agent"
 POLICY = ETC + "/policy.yaml"
 SECRETS = ETC + "/secrets.yaml"
 CACHE = "/var/cache/ha-server-agent"
-ENV = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
+ENV = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
 OUT_LIMIT = 4000
 
 
@@ -293,26 +293,30 @@ def act_nginx(cfg, target, action):
 
 def collect_certs(cfg, sec):
     def scan():
+        import hashlib
         from cryptography import x509
+        from cryptography.hazmat.primitives import serialization
         from cryptography.x509.oid import ExtensionOID, NameOID
-        paths = set()
+        used = set()  # сертифікати, на які посилаються конфіги nginx (справді віддаються клієнтам)
         for f in nginx_files():
             try:
                 for m in re.findall(r"^\s*ssl_certificate\s+([^;\s]+)\s*;", open(f, errors="replace").read(), re.M):
-                    paths.add(m)
+                    used.add(m)
             except OSError:
                 pass
-        paths |= set(glob.glob("/etc/letsencrypt/live/*/cert.pem"))
-        paths |= set(cfg.get("extra_paths") or [])
-        seen, res = set(), []
+        paths = set(used) | set(glob.glob("/etc/letsencrypt/live/*/fullchain.pem")) | set(cfg.get("extra_paths") or [])
+        by_fp = {}
         for p in sorted(paths):
             rp = os.path.realpath(p)
-            if rp in seen or not os.path.isfile(rp):
+            if not os.path.isfile(rp):
                 continue
-            seen.add(rp)
             try:
                 c = x509.load_pem_x509_certificate(open(rp, "rb").read())
             except Exception:  # noqa: BLE001
+                continue
+            fp = hashlib.sha256(c.public_bytes(serialization.Encoding.DER)).hexdigest()
+            if fp in by_fp:
+                by_fp[fp]["used"] = by_fp[fp]["used"] or p in used
                 continue
             try:
                 cn = c.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
@@ -324,18 +328,40 @@ def collect_certs(cfg, sec):
                 sans = []
             na = c.not_valid_after.replace(tzinfo=dt.timezone.utc)
             issuer = ", ".join(a.value for a in c.issuer.get_attributes_for_oid(NameOID.ORGANIZATION_NAME))
-            res.append({"path": p, "subject": cn, "names": list(sans)[:10], "issuer": issuer,
-                        "not_after": na.isoformat(), "days_left": (na - dt.datetime.now(dt.timezone.utc)).days})
-        return res
-    certs = cached("certs", 3600, scan)
-    return {"certs": certs, "min_days": min((c["days_left"] for c in certs), default=None),
+            by_fp[fp] = {"path": p, "subject": cn, "names": list(sans)[:10], "issuer": issuer, "used": p in used,
+                         "not_after": na.isoformat(), "days_left": (na - dt.datetime.now(dt.timezone.utc)).days}
+        return sorted(by_fp.values(), key=lambda x: x["days_left"])
+    certs = cached("certs2", 3600, scan)
+    used = [c for c in certs if c.get("used")]
+    return {"certs": certs, "min_days": min((c["days_left"] for c in used), default=None),
             "warn_days": cfg.get("warn_days", 14)}
 
 
 # --------------------------------------------------------------------------- Duplicati (REST API 2.1+)
 
+def dup_listen_port():
+    """Порт вебінтерфейсу Duplicati з ss: процес, у назві якого «uplicati»."""
+    rc, out, _ = run(["ss", "-ltnpH"])
+    for line in out.splitlines():
+        if "uplicati" in line:
+            m = re.search(r":(\d+)\s", line.split()[3] + " ")
+            if m:
+                return int(m.group(1))
+    return None
+
+
+DUP_URL = {}
+
+
+def dup_url(cfg):
+    if "url" not in DUP_URL:
+        port = dup_listen_port()
+        DUP_URL["url"] = f"http://127.0.0.1:{port}" if port else (cfg.get("url") or "http://127.0.0.1:8200")
+    return DUP_URL["url"]
+
+
 def dup_request(cfg, sec, method, path, body=None, token=None):
-    url = (cfg.get("url") or "http://127.0.0.1:8200").rstrip("/") + path
+    url = dup_url(cfg).rstrip("/") + path
     data = json.dumps(body).encode() if body is not None else (b"" if method == "POST" else None)
     req = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json"})
     if token:
@@ -383,7 +409,7 @@ def collect_duplicati(cfg, sec):
     acts = [a for a in (cfg.get("actions") or ["run"]) if a == "run"]
     need = {"key": "duplicati_password", "file": SECRETS, "what": "пароль вебінтерфейсу Duplicati"}
     try:
-        return {"available": True, "backups": dup_backups(cfg, sec), "actions": acts}
+        return {"available": True, "url": dup_url(cfg), "backups": dup_backups(cfg, sec), "actions": acts}
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
             # Вебінтерфейс захищено паролем: або його немає в secrets.yaml, або він неправильний
@@ -392,7 +418,7 @@ def collect_duplicati(cfg, sec):
             return {"available": False, "error": "потрібен пароль Duplicati", "needs_secret": need}
         return {"available": False, "error": f"HTTP {e.code}"}
     except urllib.error.URLError as e:
-        return {"available": False, "error": f"вебінтерфейс Duplicati недоступний ({cfg.get('url') or 'http://127.0.0.1:8200'}): {e.reason}"[:200]}
+        return {"available": False, "error": f"вебінтерфейс Duplicati недоступний ({dup_url(cfg)}): {e.reason}"[:200]}
     except Exception as e:  # noqa: BLE001
         return {"available": False, "error": str(e)[:200]}
 
@@ -722,8 +748,9 @@ def detect():
     if has_docker:
         rc, dout, _ = run(["docker", "ps", "-a", "--format", "{{.Names}}\t{{.Image}}"])
         dup_docker = next((l.split("\t")[0] for l in dout.splitlines() if "duplicati" in l.lower()), None)
-    dup_url = "http://127.0.0.1:8200"
-    if dup_docker:  # порт вебінтерфейсу, проброшений з контейнера
+    port = dup_listen_port()
+    dup_url = f"http://127.0.0.1:{port}" if port else "http://127.0.0.1:8200"
+    if dup_docker and not port:  # порт вебінтерфейсу, проброшений з контейнера
         rc, pout, _ = run(["docker", "port", dup_docker, "8200/tcp"])
         m = re.search(r":(\d+)\s*$", pout.splitlines()[0]) if pout.strip() else None
         if m:
@@ -747,6 +774,44 @@ def detect():
     return policy, found
 
 
+def merge_policy(old, new):
+    """Доповнює чинну політику тим, що автовиявлення знайшло зараз (після оновлення агента / змін на сервері).
+    Модуль, вимкнений лише тому, що його не знайшли, вмикається; keep_disabled: true — лишити вимкненим.
+    Нові сервіси, користувачі pm2 і tmux додаються; наявні налаштування й дії не змінюються."""
+    changes = []
+    for name, sec in new.items():
+        cur = old.get(name)
+        if cur is None:
+            old[name] = sec
+            changes.append(f"додано модуль {name}")
+            continue
+        if not cur.get("enabled", True) and sec.get("enabled") and not cur.get("keep_disabled"):
+            for k, v in sec.items():
+                cur.setdefault(k, v)
+            cur["enabled"] = True
+            changes.append(f"увімкнено {name}")
+        if name == "systemd":
+            for u, acts in (sec.get("units") or {}).items():
+                if u not in (cur.get("units") or {}):
+                    cur.setdefault("units", {})[u] = acts
+                    changes.append(f"сервіс {u}")
+        elif name == "pm2":
+            have = {i["user"] for i in cur.get("instances") or []}
+            for i in sec.get("instances") or []:
+                if i["user"] not in have:
+                    cur.setdefault("instances", []).append(i)
+                    changes.append(f"pm2 {i['user']}")
+        elif name == "tmux":
+            for u in sec.get("users") or []:
+                if u not in (cur.get("users") or []):
+                    cur.setdefault("users", []).append(u)
+                    changes.append(f"tmux {u}")
+        elif name == "duplicati" and sec.get("url") and cur.get("url") in (None, "http://127.0.0.1:8200") and sec["url"] != cur.get("url"):
+            cur["url"] = sec["url"]
+            changes.append(f"Duplicati {sec['url']}")
+    return old, changes
+
+
 HEADER = """# Політика HA Server Agent: що агент бачить і чим може керувати.
 # Створено автовиявленням (ha-server-agent detect). Правити вручну; після правки — нічого перезапускати не треба.
 # Дії, яких тут немає, агент не виконає навіть за правильно підписаним запитом.
@@ -764,6 +829,16 @@ def main():
         elif cmd == "action":
             req = json.loads(sys.stdin.read(65536) or "{}")
             print(json.dumps(cmd_action(req), ensure_ascii=False))
+        elif cmd == "detect" and "--merge" in sys.argv:
+            policy, found = detect()
+            old = load_yaml(POLICY)
+            merged, changes = merge_policy(old, policy)
+            if changes:
+                shutil.copy(POLICY, POLICY + ".bak")
+                with open(POLICY, "w") as f:
+                    f.write(HEADER + yaml.safe_dump(merged, allow_unicode=True, sort_keys=False))
+                os.chmod(POLICY, 0o644)
+            print("; ".join(changes) or "без змін")
         elif cmd == "detect":
             policy, found = detect()
             if "--write" in sys.argv:
