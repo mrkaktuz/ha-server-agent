@@ -260,6 +260,8 @@ EOF
   CERTINFO=$(python3 -I "$LIB/certfind.py" "$DOMAIN" || true)
   if [ -n "$CERTINFO" ]; then
     read -r CERT KEY TRUST <<< "$CERTINFO"
+    if [ "$TRUST" = trusted ]; then CERT_KIND="наявний $CERT"
+    else CERT_KIND="наявний $CERT (не з довіреного центру — HA перевіряє відбиток)"; fi
     echo "  сертифікат: наявний $CERT ($([ "$TRUST" = trusted ] && echo "довірений" || echo "власний — HA закріпить відбиток"))"
   else
     http_block > "$NGX"; ngx_apply
@@ -268,6 +270,7 @@ EOF
     if certbot certonly --webroot -w "$WEBROOT" -d "$DOMAIN" --cert-name "$DOMAIN" --non-interactive --agree-tos \
          --register-unsafely-without-email --deploy-hook "nginx -s reload" >/tmp/$NAME-certbot.log 2>&1; then
       CERT=/etc/letsencrypt/live/$DOMAIN/fullchain.pem; KEY=/etc/letsencrypt/live/$DOMAIN/privkey.pem; TRUST=trusted
+      CERT_KIND="Let's Encrypt (оновлюється автоматично)"
       echo "  отримано, оновлюватиметься автоматично"
     else
       warn "Let's Encrypt не видав сертифікат (/tmp/$NAME-certbot.log) — ставлю власний, HA закріпить його відбиток."
@@ -276,13 +279,15 @@ EOF
         -addext "subjectAltName=DNS:$DOMAIN" -keyout "$ETC/tls/nginx-key.pem" -out "$ETC/tls/nginx-cert.pem" 2>/dev/null
       chmod 600 "$ETC/tls/nginx-key.pem"
       CERT=$ETC/tls/nginx-cert.pem; KEY=$ETC/tls/nginx-key.pem; TRUST=untrusted
+      CERT_KIND="власний (Let's Encrypt не вдався — HA перевіряє відбиток)"
     fi
   fi
   # Сертифікат не з довіреного центру — HA перевірятиме його точний відбиток (pin_cert)
-  python3 - "$ETC/agent.yaml" "$CERT" "$TRUST" <<'PY'
+  python3 - "$ETC/agent.yaml" "$CERT" "$TRUST" "$CERT_KIND" <<'PY'
 import sys, yaml
-p, cert, trust = sys.argv[1:]
+p, cert, trust, kind = sys.argv[1:]
 cfg = yaml.safe_load(open(p))
+cfg["cert_kind"] = kind
 if trust == "trusted":
     cfg.pop("pin_cert", None)
 else:
@@ -389,6 +394,37 @@ if [ -n "$DOMAIN" ]; then
   ips=$(getent ahostsv4 "$DOMAIN" | awk '{print $1}' | sort -u | tr '\n' ' ')
   [ -n "$ips" ] || warn "Домен $DOMAIN не розв'язується — перевір DNS-запис у Cloudflare."
 fi
+# ---- Підсумок: у якому режимі працює агент
+python3 - "$ETC/agent.yaml" <<'PY'
+import shutil, subprocess, sys, yaml
+c = yaml.safe_load(open(sys.argv[1]))
+mode, url = c.get("mode", "local"), c.get("public_url", "")
+ips = [str(x) for x in c.get("allow_ips") or [] if not str(x).startswith(("127.", "::1"))]
+ufw = subprocess.run(["ufw", "status"], capture_output=True, text=True).stdout if shutil.which("ufw") else ""
+lines = {
+    "local": ["Режим: ЛОКАЛЬНИЙ — Home Assistant на цій самій машині",
+              f"Адреса для HA: {url} (ззовні недоступна)"],
+    "nginx": [f"Режим: NGINX — nginx приймає https://{c.get('domain')} і передає агенту на 127.0.0.1:{c.get('port')}",
+              f"        (порт {c.get('port')} ззовні закритий)",
+              f"Адреса для HA: {url}",
+              f"Сертифікат: {c.get('cert_kind', 'див. сайт nginx')}",
+              "Cloudflare: працює і з сірою, і з помаранчевою хмаркою"],
+    "tls": [f"Режим: ВЛАСНИЙ HTTPS — агент сам слухає порт {c.get('port')} (nginx на сервері не знайдено)",
+            f"Адреса для HA: {url}",
+            "Сертифікат: власний агента, HA перевіряє його відбиток",
+            f"Cloudflare: лише сіра хмарка (DNS only); порт {c.get('port')} має бути відкритий у фаєрволі провайдера"],
+}[mode]
+if mode != "local":
+    lines.append("Дозволені адреси: " + (", ".join(ips) or "будь-які (небажано)"))
+    if "Status: active" in ufw:
+        lines.append("Фаєрвол ufw: увімкнений" + ("; порт агента відкрито лише для дозволених адрес" if mode == "tls" else ""))
+w = max(len(x) for x in lines) + 2
+print("\n┌" + "─" * w + "┐")
+for x in lines:
+    print("│ " + x.ljust(w - 1) + "│")
+print("└" + "─" * w + "┘")
+PY
+
 if [ "$NO_SERVICE" = 0 ]; then
   if [ "$FIRST" = 1 ] || [ ! -s "$ETC/state/clients.yaml" ] || ! grep -q "key:" "$ETC/state/clients.yaml"; then
     say "Підключення до Home Assistant"

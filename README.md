@@ -1,128 +1,150 @@
 # HA Server Agent
 
-Агент для Ubuntu-серверів (22.04 / 24.04): показує в Home Assistant стан застосунків і дає ними керувати —
-pm2, systemd-сервіси, nginx, SSL-сертифікати, Duplicati, tmux, Docker, fail2ban, оновлення пакетів.
-Без SSH: власний API з підписами Ed25519 в обидва боки. Оновлюється сам — кнопкою в Home Assistant.
+**English** · [Українська](README.uk.md)
+
+A small agent for Ubuntu servers that lets **Home Assistant** see what runs on the server and control it:
+pm2 processes, systemd services, nginx, SSL certificates, Duplicati backups, tmux sessions, Docker containers,
+fail2ban, package updates. No SSH: the agent has its own HTTPS API where every request and every response is
+signed (Ed25519). The agent updates itself from GitHub with one click in Home Assistant.
 
 ```
-Home Assistant ──https──▶ nginx (піддомен агента) ──▶ агент 127.0.0.1:8787 (користувач ha-agent)
-   інтеграція ha_server_agent                                │ sudo — лише «collect» / «action»
-   (підписує запити, перевіряє підпис відповіді)              ▼
-                                                   помічник (root) ── policy.yaml
+Home Assistant ──https──▶ nginx (agent's subdomain) ──▶ agent on 127.0.0.1:8787 (unprivileged user)
+  integration "HA Server Agent"                               │ sudo: only "collect" / "action"
+  (signs requests, checks response signatures)                ▼
+                                                     root helper ── policy.yaml (what is allowed)
 ```
 
-## Встановлення
+## What you get in Home Assistant
 
-Ключ для читання репозиторію (один раз на сервер; потрібен і для самооновлення):
+- **Sensors per server:** problems (count + full state for dashboards), package updates, pm2 processes running,
+  days until the nearest certificate expires, last Duplicati backup, agent online, reboot required, nginx config error.
+- **Update entity** "Agent" — new agent versions appear in *Settings → Updates*, install with one click.
+- **Repairs** — if the agent needs a password (e.g. Duplicati web UI), Home Assistant tells you exactly where to put it.
+- **Action** `ha_server_agent.action` — restart / stop / start a pm2 process, a service or a container,
+  `nginx -t` + reload, run a Duplicati backup now.
+
+## Requirements
+
+- Ubuntu 22.04 or 24.04 (root access to install).
+- A (sub)domain pointing to the server, e.g. `agent.example.com` — for servers that Home Assistant reaches over the internet.
+- Home Assistant 2024.12 or newer.
+
+## Quick start
+
+**1. On the server** — clone and install (pick one line):
 
 ```bash
-sudo ssh-keygen -t ed25519 -N "" -C "ha-server-agent@$(hostname)" -f /root/.ssh/ha_server_agent
-sudo cat /root/.ssh/ha_server_agent.pub
+sudo git clone https://github.com/mrkaktuz/ha-server-agent /opt/ha-server-agent
+
+# server reachable over the internet (your Home Assistant's public IP in --allow-ip)
+sudo /opt/ha-server-agent/install.sh --domain agent.example.com --allow-ip 203.0.113.7
+# the server where Home Assistant itself runs
+sudo /opt/ha-server-agent/install.sh --local
 ```
 
-Цей рядок — у GitHub: репозиторій → Settings → Deploy keys → Add deploy key (**без** «Allow write access»).
+At the end the installer prints the **mode** it chose and a **connection code** (`HSA1:…`).
 
-```bash
-sudo git clone -c core.sshCommand="ssh -i /root/.ssh/ha_server_agent -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
-     git@github.com:mrkaktuz/ha-server-agent.git /opt/ha-server-agent
-sudo /opt/ha-server-agent/install.sh --domain agent-dev.example.com --allow-ip <домашня IP>   # віддалений сервер
-sudo /opt/ha-server-agent/install.sh --local                                                 # сервер, де працює HA
-```
+**2. In Home Assistant** — copy `homeassistant/custom_components/ha_server_agent` from this repository to
+`/config/custom_components/` and restart Home Assistant (once).
 
-Наприкінці встановлювач показує **код підключення** (`HSA1:…`): Home Assistant → Налаштування →
-Пристрої та служби → Додати інтеграцію → **HA Server Agent** → назва сервера + код. Більше нічого:
-HA сам сполучається з агентом (одноразовий секрет із коду), код після цього недійсний.
-Новий код — `sudo ha-server-agent pair`.
+**3.** *Settings → Devices & services → Add integration → **HA Server Agent*** → a name for the server + the
+connection code. Done: Home Assistant pairs with the agent by itself. The code works once and expires in 24 hours;
+a new one: `sudo ha-server-agent pair`.
 
-### Що робить встановлювач
+## Network modes (chosen automatically)
 
-- Ставить `python3-cryptography`, `python3-yaml`, `git` (якщо немає), створює системного користувача `ha-agent`.
-- **Сам знаходить**, що є на сервері: pm2 (усіх користувачів, з nvm теж), nginx, сертифікати, Duplicati
-  (сервіс або контейнер, порт), tmux-сесії, Docker, fail2ban, власні systemd-сервіси → `/etc/ha-server-agent/policy.yaml`.
-- **Мережа**, за тим, що на сервері:
-  - **nginx працює** → додає йому сайт для `--domain` (https, 443), що передає `/v1/` агенту на `127.0.0.1:8787`
-    (назовні порт не відкритий). Сертифікат: наявний, що покриває домен (напр. `*.example.com` з Let's Encrypt
-    або конфігів nginx), інакше — новий від Let's Encrypt (HTTP-перевірка через той самий nginx, оновлюється сам).
-    Якщо сертифікат не з довіреного центру — HA перевіряє його точний відбиток. Cloudflare: сіра або помаранчева
-    хмарка — обидві працюють (справжню IP клієнта nginx бере з `CF-Connecting-IP` лише від адрес Cloudflare).
-  - **nginx немає** (або `--no-nginx`) → агент сам слухає https на порту 2053 зі своїм сертифікатом (HA закріплює
-    відбиток); з ufw — порт відкривається лише для `--allow-ip`.
-  - **`--local`** → `http://127.0.0.1:8787`, лише для HA на цій самій машині.
-- Сервіс systemd, sudo лише для помічника, самоперевірка (підписаний запит; без підпису — 401; ланцюжок nginx → агент).
-
-Повторний запуск (`sudo /opt/ha-server-agent/install.sh`) — оновлення; ключі, клієнти, сертифікати й політика лишаються.
-Видалення — `sudo /opt/ha-server-agent/install.sh --uninstall` (`--purge` — разом із налаштуваннями; сайт nginx теж прибирається).
-
-## Самооновлення
-
-Агент раз на 3 години робить `git fetch` свого клону (ключем для читання) і порівнює з GitHub. Якщо є новий
-коміт — у HA з'являється оновлення (Налаштування → Оновлення, сутність «Агент» сервера). «Встановити» →
-агент у окремому процесі systemd робить `git reset --hard origin/main` і `install.sh --update`, сервіс
-перезапускається з новим кодом. Журнал — `/var/log/ha-server-agent/update.log`. Вручну: `sudo ha-server-agent update`.
-Вимкнути — `agent: {allow_update: false}` у `policy.yaml`.
-
-## Безпека
-
-| Рівень | Що робить |
-| --- | --- |
-| Мережа | Агент слухає `127.0.0.1` (за nginx) або https зі своїм сертифікатом; `allow_ips` — домашня IP (+ ufw) |
-| Підпис запиту | Кожен запит підписаний приватним ключем HA (Ed25519): метод, шлях, час, одноразовий nonce, SHA-256 тіла. Агент знає лише **публічний** ключ HA |
-| Повтори | Час ±30 с, nonce одноразовий — перехоплений запит не повторити |
-| Підпис відповіді | Агент підписує відповідь своїм ключем, прив'язуючи до nonce запиту — HA знає, що говорить саме з цим сервером |
-| Сполучення | Одноразовий секрет із коду (HMAC), діє 24 год, після використання знищується |
-| Перебір | 10 невдалих спроб — IP блокується на 15 хв; ліміт 120 запитів/хв; однакова відповідь 401 без подробиць |
-| Права | Мережевий процес — `ha-agent` без оболонки. Root-дії — лише через помічника з двома командами (sudoers); помічник виконує тільки дозволене в `policy.yaml`, фіксованим argv без оболонки, ціль звіряється з поточним станом |
-| Захищені сервіси | `ssh`, `sshd`, сам агент, `journald`, `dbus` не можна зупинити навіть через політику |
-| Оновлення | Лише з git-репозиторію (ключ лише для читання); з HA можна тільки запустити оновлення, не передати код |
-| Журнал | Кожна дія й сполучення — `/var/log/ha-server-agent/audit.log` |
-
-Агент **не вміє** навмисно: виконувати довільні команди, читати файли, змінювати конфіги.
-
-## Секрети
-
-Якщо модулю потрібен пароль (зараз — вебінтерфейс Duplicati, якщо він захищений), агент це помічає сам,
-а Home Assistant показує в **Налаштування → Ремонти**, що й куди дописати: `/etc/ha-server-agent/secrets.yaml`
-(`duplicati_password: "…"`). Перезапуск не потрібен.
-
-## Політика (`/etc/ha-server-agent/policy.yaml`)
-
-| Модуль | Що бачить | Дії (за замовчуванням) |
+| Mode | When | How Home Assistant connects |
 | --- | --- | --- |
-| `system` | ОС, ядро, час роботи, навантаження, оновлення (усього / безпеки), чи потрібне перезавантаження, збійні сервіси | — |
-| `systemd` | Сервіси зі списку `units` | свій список для кожного: `start`, `stop`, `restart`, `reload` |
-| `pm2` | Процеси користувачів з `instances`: стан, CPU, пам'ять, перезапуски, з якого часу | `start`, `stop`, `restart`, `reload` (+ `pm2 save`) |
-| `nginx` | Версія, стан, `nginx -t`, сайти й домени | `test`, `reload`, `restart` — лише після вдалого `nginx -t` |
-| `certs` | Сертифікати з конфігів nginx і Let's Encrypt: домен, видавець, днів до кінця | — |
-| `duplicati` | Завдання (API Duplicati 2.1+): остання вдала копія, помилки, розмір | `run` |
-| `tmux` | Сесії користувачів з `users`: вікна, команди, чи підключено | `kill` лише з `allow_kill: true` |
-| `docker` | Контейнери | `start`, `stop`, `restart` (`containers: []` — будь-які, інакше лише перелічені) |
-| `fail2ban` | Jail-и: заблоковано зараз / усього | — |
-| `processes` | Топ-5 процесів за CPU і пам'яттю | — |
-| `agent` | Версія, коміт, чи є новіший на GitHub | `update`, `check` |
+| **nginx** | nginx is running on the server | The installer adds an nginx site for `--domain` (HTTPS, port 443) that forwards `/v1/` to the agent on `127.0.0.1:8787` — the agent's port is never exposed. Certificate: an existing one that covers the domain (e.g. a wildcard), otherwise a new Let's Encrypt certificate (HTTP check through the same nginx, renews automatically). Works behind Cloudflare with the proxy on or off. |
+| **own HTTPS** | no nginx (or `--no-nginx`) | The agent listens on port **2053** with its own certificate; Home Assistant pins its fingerprint. If `ufw` is active the port is opened only for `--allow-ip`. Cloudflare: DNS only (grey cloud). |
+| **local** | `--local` | `http://127.0.0.1:8787`, only for Home Assistant on the same machine. |
 
-## Home Assistant
+Your other nginx sites are not touched.
 
-Інтеграція — `homeassistant/custom_components/ha_server_agent` (скопіювати в `/config/custom_components/`, перезапустити HA).
-На кожен сервер: «Проблеми» (кількість + повний стан в атрибутах — для дашборда), «Оновлення пакетів», «pm2: працює»,
-«Сертифікат: днів до кінця», «Duplicati: остання копія», «Агент на зв'язку», «Потрібне перезавантаження»,
-«nginx: помилка конфігу», оновлення «Агент». Дії — сервіс `ha_server_agent.action` (сервер, модуль, ціль, дія).
+## What the installer does
 
-## Команди на сервері
+- Installs `python3-cryptography`, `python3-yaml`, `git` if missing; creates the system user `ha-agent`.
+- **Detects** what is on the server: pm2 (all users, nvm too), nginx and its sites, certificates, Duplicati
+  (service or container, its port), tmux sessions, Docker, fail2ban, custom systemd services — and writes
+  `/etc/ha-server-agent/policy.yaml` (what the agent may show and do; edit it any time).
+- Sets up the network mode, a systemd service, a sudo rule for the helper only, runs a self-test.
+
+Running `install.sh` again updates the code and keeps keys, paired clients, certificates and the policy.
+Uninstall: `sudo /opt/ha-server-agent/install.sh --uninstall` (`--purge` also removes settings).
+
+## Self-update
+
+Every 3 hours the agent runs `git fetch` in its clone and compares with GitHub. When there is a new commit,
+the "Agent" update appears in Home Assistant. *Install* → the agent (in a separate systemd unit) runs
+`git reset --hard origin/main` and `install.sh --update`, then restarts with the new code.
+Log: `/var/log/ha-server-agent/update.log`. Manually: `sudo ha-server-agent update`.
+Disable: `agent: {allow_update: false}` in `policy.yaml`.
+
+## Security
+
+| Layer | What it does |
+| --- | --- |
+| Network | The agent listens on `127.0.0.1` behind nginx (or HTTPS with its own pinned certificate); `allow_ips` (+ ufw) |
+| Request signature | Every request is signed with Home Assistant's private key (Ed25519): method, path, time, one-time nonce, body hash. The agent only knows the **public** key |
+| Replays | Time window ±30 s, every nonce is accepted once |
+| Response signature | The agent signs every response with its own key, bound to the request nonce — Home Assistant knows it talks to *this* server |
+| Pairing | One-time secret from the connection code (HMAC), valid 24 h, destroyed after use |
+| Brute force | 10 failures → IP blocked for 15 min; 120 requests/min limit; the same `401` for every auth failure |
+| Privileges | The network process runs as `ha-agent` (no shell). Root actions go only through a helper with two commands (sudoers); the helper performs only what `policy.yaml` allows, with a fixed argv and no shell, and checks the target against the current state |
+| Protected services | `ssh`, `sshd`, the agent itself, `journald`, `dbus` can never be stopped |
+| Updates | Only from the git repository; Home Assistant can start an update but cannot send code |
+| Audit | Every action and pairing → `/var/log/ha-server-agent/audit.log` |
+
+By design the agent **cannot** run arbitrary commands, read files or change configs.
+
+## Secrets
+
+If a module needs a password (today: a password-protected Duplicati web UI), the agent notices it and Home
+Assistant shows a repair: add `duplicati_password: "…"` to `/etc/ha-server-agent/secrets.yaml` (root-only).
+No restart needed.
+
+## Policy (`/etc/ha-server-agent/policy.yaml`)
+
+| Module | Shows | Actions (default) |
+| --- | --- | --- |
+| `system` | OS, kernel, uptime, load, updates (total / security), reboot required, failed services | — |
+| `systemd` | Services listed in `units` | per service: `start`, `stop`, `restart`, `reload` |
+| `pm2` | Processes of users in `instances`: status, CPU, memory, restarts, uptime | `start`, `stop`, `restart`, `reload` (+ `pm2 save`) |
+| `nginx` | Version, state, `nginx -t`, sites and domains | `test`, `reload`, `restart` — only after a successful `nginx -t` |
+| `certs` | Certificates from nginx configs and Let's Encrypt: domain, issuer, days left | — |
+| `duplicati` | Backups (Duplicati 2.1+ API): last success, errors, size | `run` |
+| `tmux` | Sessions of users in `users`: windows, commands, attached | `kill` only with `allow_kill: true` |
+| `docker` | Containers | `start`, `stop`, `restart` (`containers: []` = any, otherwise only listed) |
+| `fail2ban` | Jails: banned now / total | — |
+| `processes` | Top 5 processes by CPU and memory | — |
+| `agent` | Version, commit, newer commit on GitHub | `update`, `check` |
+
+## Commands on the server
 
 ```
-sudo ha-server-agent pair                новий код підключення
-sudo ha-server-agent clients             хто підключений;  remove-client NAME — відключити
-sudo ha-server-agent allow-ip IP ...     дозволені адреси
-sudo ha-server-agent detect              що знайдено; --write --force — перезаписати policy.yaml
-sudo ha-server-agent test                самоперевірка
-sudo ha-server-agent update              оновити з GitHub
+sudo ha-server-agent pair                new connection code
+sudo ha-server-agent clients             paired clients;  remove-client NAME — unpair
+sudo ha-server-agent allow-ip IP ...     allowed client addresses
+sudo ha-server-agent detect              what was found;  --write --force — rewrite policy.yaml
+sudo ha-server-agent test                self-test
+sudo ha-server-agent update              update from GitHub
 sudo ha-server-agent status
-journalctl -u ha-server-agent            журнал сервісу
+journalctl -u ha-server-agent            service log
 ```
 
-## Перевірка без сервера
+## Troubleshooting
 
-`test/container-setup.sh` — Ubuntu 24.04 у Docker з nginx, tmux і pm2: агент ставиться в режимі nginx,
-друкує код підключення; origin — змонтований репозиторій (новий коміт → оновлення в HA).
-`test/client.py` — підписані запити ззовні: дії, відмови політики, чужий підпис, підмінене тіло,
-застарілий час, повтор nonce.
+- **"Agent did not accept the code"** — the code was already used or expired (`sudo ha-server-agent pair`),
+  or Home Assistant's IP is not in `allow_ips` (`sudo ha-server-agent allow-ip <IP>`).
+- **"Cannot connect"** — check DNS for the domain, ports 443 (nginx mode) or 2053 (own HTTPS) in the provider's firewall.
+- **Let's Encrypt failed** — the domain must resolve to the server and port 80 must be reachable; the agent then
+  uses its own certificate (Home Assistant pins it) — it still works. Details: `/tmp/ha-server-agent-certbot.log`.
+- Logs: `journalctl -u ha-server-agent`, `/var/log/ha-server-agent/audit.log`, `/var/log/ha-server-agent/update.log`.
+
+## Testing without a server
+
+`test/container-setup.sh` — Ubuntu 24.04 in Docker with nginx, tmux and pm2; installs the agent in nginx mode and
+prints a connection code. `test/client.py` — signed requests from outside: actions, policy denials, a foreign
+signature, a tampered body, an old timestamp, a replayed nonce.
+
+Code comments and server messages are in Ukrainian.
