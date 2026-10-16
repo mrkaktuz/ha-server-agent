@@ -37,4 +37,4 @@ ha-server-agent pair
 echo READY
 # Імітація systemctl restart після самооновлення: коли код агента змінився — перезапустити процес
 last=$(md5sum /usr/local/lib/ha-server-agent/server.py)
-while sleep 5; do now=$(md5sum /usr/local/lib/ha-server-agent/server.py); [ "$now" != "$last" ] && { pkill -f ha-server-agent/server.py; last=$now; echo "агента перезапущено після оновлення"; }; done
+while sleep 5; do now=$(md5sum /usr/local/lib/ha-server-agent/server.py); [ "$now" != "$last" ] && { pkill -f "^python3 -I /usr/local/lib/ha-server-agent/server.py"; last=$now; echo "агента перезапущено після оновлення"; }; done

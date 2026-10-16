@@ -1,99 +1,128 @@
-# Dim Server Agent
+# HA Server Agent
 
-Маленький агент для Ubuntu-серверів: показує в Home Assistant стан застосунків і дає ними
-керувати — pm2, systemd-сервіси, nginx, SSL-сертифікати, Duplicati, tmux, Docker, fail2ban,
-оновлення пакетів. Без SSH: власний API з підписами Ed25519 в обидва боки.
+Агент для Ubuntu-серверів (22.04 / 24.04): показує в Home Assistant стан застосунків і дає ними керувати —
+pm2, systemd-сервіси, nginx, SSL-сертифікати, Duplicati, tmux, Docker, fail2ban, оновлення пакетів.
+Без SSH: власний API з підписами Ed25519 в обидва боки. Оновлюється сам — кнопкою в Home Assistant.
 
 ```
-Home Assistant ──https (Cloudflare)──▶ nginx ──▶ dim-agent (127.0.0.1:8787, користувач dim-agent)
-   інтеграція dim_server_agent                        │ sudo — лише «collect» / «action»
-   (підписує запити, перевіряє підпис відповіді)      ▼
-                                              dim-agent-helper (root) ── policy.yaml
+Home Assistant ──https──▶ nginx (піддомен агента) ──▶ агент 127.0.0.1:8787 (користувач ha-agent)
+   інтеграція ha_server_agent                                │ sudo — лише «collect» / «action»
+   (підписує запити, перевіряє підпис відповіді)              ▼
+                                                   помічник (root) ── policy.yaml
 ```
+
+## Встановлення
+
+Ключ для читання репозиторію (один раз на сервер; потрібен і для самооновлення):
+
+```bash
+sudo ssh-keygen -t ed25519 -N "" -C "ha-server-agent@$(hostname)" -f /root/.ssh/ha_server_agent
+sudo cat /root/.ssh/ha_server_agent.pub
+```
+
+Цей рядок — у GitHub: репозиторій → Settings → Deploy keys → Add deploy key (**без** «Allow write access»).
+
+```bash
+sudo git clone -c core.sshCommand="ssh -i /root/.ssh/ha_server_agent -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
+     git@github.com:mrkaktuz/ha-server-agent.git /opt/ha-server-agent
+sudo /opt/ha-server-agent/install.sh --domain agent-dev.example.com --allow-ip <домашня IP>   # віддалений сервер
+sudo /opt/ha-server-agent/install.sh --local                                                 # сервер, де працює HA
+```
+
+Наприкінці встановлювач показує **код підключення** (`HSA1:…`): Home Assistant → Налаштування →
+Пристрої та служби → Додати інтеграцію → **HA Server Agent** → назва сервера + код. Більше нічого:
+HA сам сполучається з агентом (одноразовий секрет із коду), код після цього недійсний.
+Новий код — `sudo ha-server-agent pair`.
+
+### Що робить встановлювач
+
+- Ставить `python3-cryptography`, `python3-yaml`, `git` (якщо немає), створює системного користувача `ha-agent`.
+- **Сам знаходить**, що є на сервері: pm2 (усіх користувачів, з nvm теж), nginx, сертифікати, Duplicati
+  (сервіс або контейнер, порт), tmux-сесії, Docker, fail2ban, власні systemd-сервіси → `/etc/ha-server-agent/policy.yaml`.
+- **Мережа**, за тим, що на сервері:
+  - **nginx працює** → додає йому сайт для `--domain` (https, 443), що передає `/v1/` агенту на `127.0.0.1:8787`
+    (назовні порт не відкритий). Сертифікат: наявний, що покриває домен (напр. `*.example.com` з Let's Encrypt
+    або конфігів nginx), інакше — новий від Let's Encrypt (HTTP-перевірка через той самий nginx, оновлюється сам).
+    Якщо сертифікат не з довіреного центру — HA перевіряє його точний відбиток. Cloudflare: сіра або помаранчева
+    хмарка — обидві працюють (справжню IP клієнта nginx бере з `CF-Connecting-IP` лише від адрес Cloudflare).
+  - **nginx немає** (або `--no-nginx`) → агент сам слухає https на порту 2053 зі своїм сертифікатом (HA закріплює
+    відбиток); з ufw — порт відкривається лише для `--allow-ip`.
+  - **`--local`** → `http://127.0.0.1:8787`, лише для HA на цій самій машині.
+- Сервіс systemd, sudo лише для помічника, самоперевірка (підписаний запит; без підпису — 401; ланцюжок nginx → агент).
+
+Повторний запуск (`sudo /opt/ha-server-agent/install.sh`) — оновлення; ключі, клієнти, сертифікати й політика лишаються.
+Видалення — `sudo /opt/ha-server-agent/install.sh --uninstall` (`--purge` — разом із налаштуваннями; сайт nginx теж прибирається).
+
+## Самооновлення
+
+Агент раз на 3 години робить `git fetch` свого клону (ключем для читання) і порівнює з GitHub. Якщо є новий
+коміт — у HA з'являється оновлення (Налаштування → Оновлення, сутність «Агент» сервера). «Встановити» →
+агент у окремому процесі systemd робить `git reset --hard origin/main` і `install.sh --update`, сервіс
+перезапускається з новим кодом. Журнал — `/var/log/ha-server-agent/update.log`. Вручну: `sudo ha-server-agent update`.
+Вимкнути — `agent: {allow_update: false}` у `policy.yaml`.
 
 ## Безпека
 
 | Рівень | Що робить |
 | --- | --- |
-| Мережа | Агент слухає лише `127.0.0.1`; назовні — тільки через nginx/Cloudflare. `allow_ips` — домашня IP (береться з `CF-Connecting-IP`, і лише для запитів від локального nginx) |
+| Мережа | Агент слухає `127.0.0.1` (за nginx) або https зі своїм сертифікатом; `allow_ips` — домашня IP (+ ufw) |
 | Підпис запиту | Кожен запит підписаний приватним ключем HA (Ed25519): метод, шлях, час, одноразовий nonce, SHA-256 тіла. Агент знає лише **публічний** ключ HA |
-| Повтори | Час запиту ±30 с, nonce одноразовий — перехоплений запит повторити не можна |
-| Підпис відповіді | Агент підписує відповідь своїм ключем, прив'язуючи до nonce запиту — HA перевіряє, що говорить саме з цим сервером |
+| Повтори | Час ±30 с, nonce одноразовий — перехоплений запит не повторити |
+| Підпис відповіді | Агент підписує відповідь своїм ключем, прив'язуючи до nonce запиту — HA знає, що говорить саме з цим сервером |
+| Сполучення | Одноразовий секрет із коду (HMAC), діє 24 год, після використання знищується |
 | Перебір | 10 невдалих спроб — IP блокується на 15 хв; ліміт 120 запитів/хв; однакова відповідь 401 без подробиць |
-| Права | Мережевий процес — системний користувач `dim-agent` без оболонки. Root-дії — лише через помічника з двома командами (sudoers); помічник виконує тільки дозволене в `policy.yaml`, фіксованим argv без оболонки, ціль звіряється з поточним станом |
-| Захищені сервіси | `ssh`, `sshd`, `dim-agent`, `journald`, `dbus` не можна зупинити навіть через політику |
-| Журнал | Кожна дія — `/var/log/dim-agent/audit.log` (хто, з якої IP, що, результат) |
+| Права | Мережевий процес — `ha-agent` без оболонки. Root-дії — лише через помічника з двома командами (sudoers); помічник виконує тільки дозволене в `policy.yaml`, фіксованим argv без оболонки, ціль звіряється з поточним станом |
+| Захищені сервіси | `ssh`, `sshd`, сам агент, `journald`, `dbus` не можна зупинити навіть через політику |
+| Оновлення | Лише з git-репозиторію (ключ лише для читання); з HA можна тільки запустити оновлення, не передати код |
+| Журнал | Кожна дія й сполучення — `/var/log/ha-server-agent/audit.log` |
 
-Що агент **не вміє** навмисно: виконувати довільні команди, читати файли, змінювати конфіги.
+Агент **не вміє** навмисно: виконувати довільні команди, читати файли, змінювати конфіги.
 
-## Встановлення на сервер (Ubuntu 22.04 / 24.04)
+## Секрети
 
-```bash
-git clone <цей репозиторій> dim-server-agent && cd dim-server-agent
-sudo ./install.sh --allow-ip <домашня IP>
-```
+Якщо модулю потрібен пароль (зараз — вебінтерфейс Duplicati, якщо він захищений), агент це помічає сам,
+а Home Assistant показує в **Налаштування → Ремонти**, що й куди дописати: `/etc/ha-server-agent/secrets.yaml`
+(`duplicati_password: "…"`). Перезапуск не потрібен.
 
-Встановлювач: ставить `python3-cryptography`, `python3-yaml` (якщо немає), створює користувача
-`dim-agent`, ключ агента, **сам знаходить** pm2 (усіх користувачів, з nvm теж), nginx, сертифікати,
-Duplicati, tmux-сесії, Docker, fail2ban і власні systemd-сервіси → пише `/etc/dim-agent/policy.yaml`,
-запускає сервіс і робить самоперевірку. Наприкінці показує **публічний ключ агента**.
-
-Оновлення — `git pull && sudo ./install.sh` (ключі, клієнти й політика лишаються).
-Видалення — `sudo ./install.sh --uninstall` (`--purge` — разом із налаштуваннями).
-
-### nginx + Cloudflare
-
-Приклад — `nginx/dim-agent.conf.example`: піддомен `agent.<домен>` через Cloudflare (проксі увімкнено),
-`location /v1/` → `127.0.0.1:8787`. Бажано ще правило Cloudflare WAF «лише домашня IP» для цього піддомену.
-
-### Підключення до Home Assistant
-
-1. Скопіювати `homeassistant/custom_components/dim_server_agent` у `/config/custom_components/` і перезапустити HA.
-2. Налаштування → Пристрої та служби → Додати інтеграцію → **Dim Server Agent**: назва, адреса
-   (`https://agent.<домен>`, без шляху), публічний ключ агента.
-3. HA покаже **свій** ключ — на сервері: `sudo dim-agent add-client home-assistant <ключ>` → «Надіслати».
-
-З'являться: «Проблеми» (кількість + повний стан в атрибутах), «Оновлення пакетів», «pm2: працює»,
-«Сертифікат: днів до кінця», «Duplicati: остання копія», «Агент на зв'язку», «Потрібне перезавантаження»,
-«nginx: помилка конфігу». Дії — сервіс `dim_server_agent.action` (сервер, модуль, ціль, дія).
-
-## Політика (`/etc/dim-agent/policy.yaml`)
-
-Створюється автовиявленням; правити вручну (перезапуск не потрібен). Модуль з `enabled: false` агент не чіпає.
+## Політика (`/etc/ha-server-agent/policy.yaml`)
 
 | Модуль | Що бачить | Дії (за замовчуванням) |
 | --- | --- | --- |
 | `system` | ОС, ядро, час роботи, навантаження, оновлення (усього / безпеки), чи потрібне перезавантаження, збійні сервіси | — |
-| `systemd` | Сервіси зі списку `units` | для кожного свій список: `start`, `stop`, `restart`, `reload` |
-| `pm2` | Процеси кожного користувача з `instances`: стан, CPU, пам'ять, перезапуски, з якого часу | `start`, `stop`, `restart`, `reload` (+ `pm2 save`) |
-| `nginx` | Версія, стан, `nginx -t`, сайти й домени | `test`, `reload`, `restart` — reload/restart лише після вдалого `nginx -t` |
+| `systemd` | Сервіси зі списку `units` | свій список для кожного: `start`, `stop`, `restart`, `reload` |
+| `pm2` | Процеси користувачів з `instances`: стан, CPU, пам'ять, перезапуски, з якого часу | `start`, `stop`, `restart`, `reload` (+ `pm2 save`) |
+| `nginx` | Версія, стан, `nginx -t`, сайти й домени | `test`, `reload`, `restart` — лише після вдалого `nginx -t` |
 | `certs` | Сертифікати з конфігів nginx і Let's Encrypt: домен, видавець, днів до кінця | — |
-| `duplicati` | Завдання (API Duplicati 2.1+): остання вдала копія, помилки, розмір | `run` (пароль — `secrets.yaml: duplicati_password`) |
+| `duplicati` | Завдання (API Duplicati 2.1+): остання вдала копія, помилки, розмір | `run` |
 | `tmux` | Сесії користувачів з `users`: вікна, команди, чи підключено | `kill` лише з `allow_kill: true` |
 | `docker` | Контейнери | `start`, `stop`, `restart` (`containers: []` — будь-які, інакше лише перелічені) |
 | `fail2ban` | Jail-и: заблоковано зараз / усього | — |
 | `processes` | Топ-5 процесів за CPU і пам'яттю | — |
+| `agent` | Версія, коміт, чи є новіший на GitHub | `update`, `check` |
+
+## Home Assistant
+
+Інтеграція — `homeassistant/custom_components/ha_server_agent` (скопіювати в `/config/custom_components/`, перезапустити HA).
+На кожен сервер: «Проблеми» (кількість + повний стан в атрибутах — для дашборда), «Оновлення пакетів», «pm2: працює»,
+«Сертифікат: днів до кінця», «Duplicati: остання копія», «Агент на зв'язку», «Потрібне перезавантаження»,
+«nginx: помилка конфігу», оновлення «Агент». Дії — сервіс `ha_server_agent.action` (сервер, модуль, ціль, дія).
 
 ## Команди на сервері
 
 ```
-sudo dim-agent show-key                 публічний ключ агента
-sudo dim-agent add-client NAME KEY      дозволити клієнта (ключ показує HA)
-sudo dim-agent remove-client NAME
-sudo dim-agent clients
-sudo dim-agent allow-ip 1.2.3.4         дозволені адреси (без аргументів — будь-які)
-sudo dim-agent detect                   що знайдено; --write --force — перезаписати policy.yaml
-sudo dim-agent test                     самоперевірка (підписаний запит, перевірка відповіді, 401 без підпису)
-sudo dim-agent status
-journalctl -u dim-agent                 журнал сервісу;  /var/log/dim-agent/audit.log — дії
+sudo ha-server-agent pair                новий код підключення
+sudo ha-server-agent clients             хто підключений;  remove-client NAME — відключити
+sudo ha-server-agent allow-ip IP ...     дозволені адреси
+sudo ha-server-agent detect              що знайдено; --write --force — перезаписати policy.yaml
+sudo ha-server-agent test                самоперевірка
+sudo ha-server-agent update              оновити з GitHub
+sudo ha-server-agent status
+journalctl -u ha-server-agent            журнал сервісу
 ```
 
 ## Перевірка без сервера
 
-`test/container-setup.sh` — Ubuntu 24.04 у Docker з nginx (https-сайт), tmux і pm2 (два застосунки);
-ставить агента встановлювачем і робить самоперевірку. `test/client.py` — підписані запити ззовні:
-дії, відмови політики, чужий підпис, підмінене тіло, застарілий час, повтор nonce.
-
-```bash
-docker run -d --name dim-agent-test -p 127.0.0.1:18787:8787 -v "$PWD":/src:ro ubuntu:24.04 bash /src/test/container-setup.sh
-```
+`test/container-setup.sh` — Ubuntu 24.04 у Docker з nginx, tmux і pm2: агент ставиться в режимі nginx,
+друкує код підключення; origin — змонтований репозиторій (новий коміт → оновлення в HA).
+`test/client.py` — підписані запити ззовні: дії, відмови політики, чужий підпис, підмінене тіло,
+застарілий час, повтор nonce.

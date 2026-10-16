@@ -39,6 +39,8 @@ class AgentClient:
         if status in (401, 429):
             raise AgentAuthError(f"агент відхилив запит (HTTP {status})")
         sig, rts = headers.get(P.H_SIG), headers.get(P.H_TIME)
+        if not sig and status in (502, 503, 504):
+            raise AgentError(f"агент не відповідає (HTTP {status} від проксі)")
         if not sig or not rts or not P.verify(self._agent_pub, P.resp_message(status, nonce, rts, raw), sig):
             raise AgentSignatureError("відповідь без дійсного підпису агента")
         if abs(time.time() - int(rts)) > P.MAX_SKEW * 2:
