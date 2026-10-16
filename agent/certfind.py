@@ -57,7 +57,7 @@ def trusted(cert):
 
 def find(host):
     best = None
-    now = dt.datetime.utcnow()
+    now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)  # not_valid_after — без часового поясу (UTC)
     for c, k in pairs():
         try:
             cert = x509.load_pem_x509_certificate(open(c, "rb").read())

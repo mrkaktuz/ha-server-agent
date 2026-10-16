@@ -23,6 +23,7 @@ chown deploy: /home/deploy/*.js
 runuser -l deploy -c 'pm2 start /home/deploy/api.js --name api >/dev/null && pm2 start /home/deploy/worker.js --name worker >/dev/null'
 runuser -l deploy -c 'tmux new -d -s build "bash"'
 tmux new -d -s root-shell bash
+git config --global --add safe.directory "*"
 git clone -q /src /opt/ha-server-agent
 git -C /opt/ha-server-agent remote set-head origin -a >/dev/null
 cd /opt/ha-server-agent
