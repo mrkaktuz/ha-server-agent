@@ -262,7 +262,7 @@ def pm2_autostart(inst, apps):
         if dirs and not any(os.path.exists(os.path.join(d, "node")) for d in dirs):
             issues.append("у PATH сервісу немає node (мабуть, версію з nvm видалено)")
         if env.get("PM2_HOME") and os.path.realpath(env["PM2_HOME"]) != os.path.realpath(home):
-            issues.append(f"сервіс використовує інший PM2_HOME: {env['PM2_HOME']}")
+            issues.append(f"сервіс використовує інший PM2_HOME: {env['PM2_HOME']} (працює pm2 з {home})")
         if (p.get("User") or "root") != user:
             issues.append(f"сервіс запускається від іншого користувача: {p.get('User') or 'root'}")
     saved = None
@@ -277,7 +277,7 @@ def pm2_autostart(inst, apps):
         miss = [a["name"] for a in apps if a["name"] not in saved]
         if miss:
             issues.append("не збережено (pm2 save): " + ", ".join(miss))
-    return {"unit": unit, "unit_enabled": p.get("UnitFileState"), "unit_active": p.get("ActiveState"),
+    return {"unit": unit, "pm2_home": home, "unit_enabled": p.get("UnitFileState"), "unit_active": p.get("ActiveState"),
             "saved": saved, "issues": issues, "ok": not issues}
 
 
