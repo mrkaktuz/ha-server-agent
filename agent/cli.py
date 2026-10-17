@@ -163,10 +163,19 @@ def selftest():
         time.sleep(0.3)
         for path in ("/v1/ping", "/v1/state"):
             ts, nonce = str(int(time.time())), P.new_nonce()
-            with local_request(cfg, path, {P.H_KEY: P.key_id(pub_b64), P.H_TIME: ts, P.H_NONCE: nonce,
-                                           P.H_SIG: P.sign(priv, P.req_message("GET", path, ts, nonce, b""))}) as r:
-                body = r.read()
-                ok = P.verify(agent_pub, P.resp_message(r.status, nonce, r.headers[P.H_TIME], body), r.headers[P.H_SIG])
+            try:
+                with local_request(cfg, path, {P.H_KEY: P.key_id(pub_b64), P.H_TIME: ts, P.H_NONCE: nonce,
+                                               P.H_SIG: P.sign(priv, P.req_message("GET", path, ts, nonce, b""))}) as r:
+                    body = r.read()
+                    ok = P.verify(agent_pub, P.resp_message(r.status, nonce, r.headers[P.H_TIME], body), r.headers[P.H_SIG])
+            except urllib.error.HTTPError as e:
+                detail = e.read().decode(errors="replace")
+                try:
+                    detail = json.loads(detail).get("error", detail)
+                except ValueError:
+                    pass
+                print(f"{path.split('/')[-1]}: ПОМИЛКА {e.code} — {detail}")
+                return False
             ok_all &= ok
             data = json.loads(body)
             if path == "/v1/ping":

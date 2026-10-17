@@ -295,6 +295,7 @@ def collect_certs(cfg, sec):
     def scan():
         import hashlib
         from cryptography import x509
+        from cryptography.hazmat.backends import default_backend  # обов'язковий для cryptography < 3.1 (Ubuntu 20.04)
         from cryptography.hazmat.primitives import serialization
         from cryptography.x509.oid import ExtensionOID, NameOID
         used = set()  # сертифікати, на які посилаються конфіги nginx (справді віддаються клієнтам)
@@ -311,7 +312,7 @@ def collect_certs(cfg, sec):
             if not os.path.isfile(rp):
                 continue
             try:
-                c = x509.load_pem_x509_certificate(open(rp, "rb").read())
+                c = x509.load_pem_x509_certificate(open(rp, "rb").read(), default_backend())
             except Exception:  # noqa: BLE001
                 continue
             fp = hashlib.sha256(c.public_bytes(serialization.Encoding.DER)).hexdigest()

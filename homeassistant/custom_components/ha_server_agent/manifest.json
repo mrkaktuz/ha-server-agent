@@ -7,5 +7,5 @@
   "documentation": "https://github.com/mrkaktuz/ha-server-agent",
   "iot_class": "cloud_polling",
   "requirements": [],
-  "version": "0.2.2"
+  "version": "0.2.3"
 }

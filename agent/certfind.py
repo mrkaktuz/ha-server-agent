@@ -16,6 +16,7 @@ import subprocess
 import sys
 
 from cryptography import x509
+from cryptography.hazmat.backends import default_backend  # обов'язковий для cryptography < 3.1 (Ubuntu 20.04)
 
 
 def covers(name, host):
@@ -60,7 +61,7 @@ def find(host):
     now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)  # not_valid_after — без часового поясу (UTC)
     for c, k in pairs():
         try:
-            cert = x509.load_pem_x509_certificate(open(c, "rb").read())
+            cert = x509.load_pem_x509_certificate(open(c, "rb").read(), default_backend())
         except Exception:  # noqa: BLE001
             continue
         try:

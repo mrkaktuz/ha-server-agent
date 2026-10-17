@@ -25,7 +25,7 @@ Home Assistant ──https──▶ nginx (agent's subdomain) ──▶ agent on
 
 ## Requirements
 
-- Ubuntu 22.04 or 24.04 (root access to install).
+- Ubuntu 20.04, 22.04 or 24.04 (root access to install).
 - A (sub)domain pointing to the server, e.g. `agent.example.com` — for servers that Home Assistant reaches over the internet.
 - Home Assistant 2024.12 or newer.
 

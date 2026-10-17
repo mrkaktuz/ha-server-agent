@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# HA Server Agent — встановлення / оновлення на Ubuntu 22.04 / 24.04.
+# HA Server Agent — встановлення / оновлення на Ubuntu 20.04 / 22.04 / 24.04.
 #
 #   Віддалений сервер (HA ходить через інтернет):
 #     sudo ./install.sh --domain agent-dev.example.com --allow-ip 1.2.3.4
@@ -354,10 +354,8 @@ Group=$USR
 ExecStart=/usr/bin/python3 -I $LIB/server.py
 Restart=on-failure
 RestartSec=5
-# Посилення, що не заважає sudo-помічнику
-ProtectKernelModules=yes
-LockPersonality=yes
-RestrictRealtime=yes
+# Без ProtectKernelModules / LockPersonality / RestrictRealtime тощо: для сервісу без root вони вмикають
+# NoNewPrivileges, і sudo-помічник перестає працювати. Обмеження прав — через sudoers і policy.yaml.
 UMask=0077
 
 [Install]

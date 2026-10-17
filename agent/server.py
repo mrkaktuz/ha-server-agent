@@ -32,7 +32,7 @@ import yaml
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import protocol as P  # noqa: E402
 
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 ETC = "/etc/ha-server-agent"
 CONFIG = ETC + "/agent.yaml"
 KEY = ETC + "/agent.key"
