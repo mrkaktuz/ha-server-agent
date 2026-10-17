@@ -9,8 +9,11 @@
 кожна дія — фіксований argv без оболонки, ціль перевіряється за поточним станом.
 """
 
+import base64
 import datetime as dt
 import glob
+import hashlib
+import http.cookiejar
 import json
 import os
 import pwd
@@ -20,6 +23,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import yaml
@@ -125,9 +129,16 @@ def collect_system(cfg, sec):
 
     def updates():
         # apt-check (update-notifier-common) пише «усього;безпеки» у stderr
-        rc, out, err = run(["/usr/lib/update-notifier/apt-check"], timeout=60)
-        m = re.match(r"^(\d+);(\d+)", (err or out).strip())
-        return {"total": int(m.group(1)), "security": int(m.group(2))} if m else None
+        if os.path.exists("/usr/lib/update-notifier/apt-check"):
+            rc, out, err = run(["/usr/lib/update-notifier/apt-check"], timeout=60)
+            m = re.search(r"^(\d+);(\d+)\s*$", err + "\n" + out, re.M)
+            if m:
+                return {"total": int(m.group(1)), "security": int(m.group(2))}
+        rc, out, _ = run(["apt-get", "-s", "-o", "Debug::NoLocking=1", "upgrade"], timeout=60)
+        inst = [line for line in out.splitlines() if line.startswith("Inst ")]
+        if rc != 0 and not inst:
+            return None
+        return {"total": len(inst), "security": sum(1 for line in inst if "-security" in line)}
 
     rc, out, _ = run(["systemctl", "--failed", "--no-legend", "--plain", "--type=service"])
     failed = [line.split()[0] for line in out.splitlines() if line.strip()]
@@ -161,7 +172,7 @@ def collect_systemd(cfg, sec):
     for name, acts in units.items():
         rc, out, _ = run(["systemctl", "show", name, "--no-pager",
                           "-p", "Id,Description,LoadState,ActiveState,SubState,UnitFileState,MainPID,"
-                                "ActiveEnterTimestamp,MemoryCurrent,NRestarts"])
+                                "ActiveEnterTimestamp,MemoryCurrent,NRestarts,Type,Result,RemainAfterExit"])
         p = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
         if p.get("LoadState") == "not-found":
             continue
@@ -172,6 +183,7 @@ def collect_systemd(cfg, sec):
             "enabled": p.get("UnitFileState", ""), "since": p.get("ActiveEnterTimestamp", "") or None,
             "pid": int(p.get("MainPID") or 0), "restarts": int(p.get("NRestarts") or 0) if (p.get("NRestarts") or "").isdigit() else None,
             "memory": int(mem) if mem.isdigit() else None, "actions": acts,
+            "oneshot": p.get("Type") == "oneshot" and p.get("RemainAfterExit") != "yes", "result": p.get("Result", ""),
         })
     return {"units": res}
 
@@ -351,33 +363,88 @@ def dup_listen_port():
     return None
 
 
-DUP_URL = {}
+DUP = {}  # url і cookie (xsrf-token, session-auth — для Duplicati 2.0)
 
 
 def dup_url(cfg):
-    if "url" not in DUP_URL:
+    if "url" not in DUP:
         port = dup_listen_port()
-        DUP_URL["url"] = f"http://127.0.0.1:{port}" if port else (cfg.get("url") or "http://127.0.0.1:8200")
-    return DUP_URL["url"]
+        DUP["url"] = f"http://127.0.0.1:{port}" if port else (cfg.get("url") or "http://127.0.0.1:8200")
+    return DUP["url"]
 
 
-def dup_request(cfg, sec, method, path, body=None, token=None):
+def dup_opener():
+    if "opener" not in DUP:
+        DUP["jar"] = http.cookiejar.CookieJar()
+        DUP["opener"] = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(DUP["jar"]))
+    return DUP["opener"]
+
+
+def dup_cookie(name):
+    dup_opener()
+    for c in DUP["jar"]:
+        if c.name == name:
+            return urllib.parse.unquote(c.value)
+    return None
+
+
+def dup_xsrf(cfg):
+    """Duplicati 2.0 вимагає X-XSRF-Token; cookie з ним ставить будь-яка сторінка вебінтерфейсу."""
+    try:
+        dup_opener().open(dup_url(cfg).rstrip("/") + "/", timeout=15).read()
+    except urllib.error.HTTPError:
+        pass
+    return dup_cookie("xsrf-token")
+
+
+def dup_request(cfg, sec, method, path, body=None, token=None, form=None, retry=True):
     url = dup_url(cfg).rstrip("/") + path
-    data = json.dumps(body).encode() if body is not None else (b"" if method == "POST" else None)
-    req = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json"})
+    ctype = "application/json"
+    if form is not None:
+        data, ctype = urllib.parse.urlencode(form).encode(), "application/x-www-form-urlencoded"
+    else:
+        data = json.dumps(body).encode() if body is not None else (b"" if method == "POST" else None)
+    req = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": ctype})
     if token:
         req.add_header("Authorization", "Bearer " + token)
-    with urllib.request.urlopen(req, timeout=15) as r:
-        raw = r.read()
+    xsrf = dup_cookie("xsrf-token")
+    if xsrf:
+        req.add_header("X-XSRF-Token", xsrf)
+    try:
+        with dup_opener().open(req, timeout=15) as r:
+            raw = r.read()
+    except urllib.error.HTTPError as e:
+        if e.code == 400 and retry and not xsrf and dup_xsrf(cfg):
+            return dup_request(cfg, sec, method, path, body, token, form, retry=False)
+        raise
+    try:
         return json.loads(raw) if raw else None
+    except ValueError:
+        return None
+
+
+def dup_login_legacy(cfg, sec, pw):
+    """Вхід у Duplicati 2.0: sha256(nonce + sha256(пароль + сіль)) → cookie session-auth."""
+    r = dup_request(cfg, sec, "POST", "/login.cgi", form={"get-nonce": "1"}) or {}
+    salted = hashlib.sha256(pw.encode() + base64.b64decode(r["Salt"])).digest()
+    proof = base64.b64encode(hashlib.sha256(base64.b64decode(r["Nonce"]) + salted).digest()).decode()
+    dup_request(cfg, sec, "POST", "/login.cgi", form={"password": proof})
 
 
 def dup_token(cfg, sec):
+    if "token" in DUP:
+        return DUP["token"]
     pw = sec.get("duplicati_password")
-    if not pw:
-        return None
-    r = dup_request(cfg, sec, "POST", "/api/v1/auth/login", {"Password": pw, "RememberMe": False})
-    return (r or {}).get("AccessToken")
+    tok = None
+    if pw:
+        try:
+            tok = (dup_request(cfg, sec, "POST", "/api/v1/auth/login", {"Password": pw, "RememberMe": False}) or {}).get("AccessToken")
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403) and not dup_cookie("xsrf-token"):
+                raise
+            dup_login_legacy(cfg, sec, pw)  # Duplicati 2.0: API входу немає
+    DUP["token"] = tok
+    return tok
 
 
 def dup_time(v):
@@ -698,6 +765,15 @@ KNOWN_UNITS = {
 }
 
 
+def oneshot_file(path):
+    """Одноразовий сервіс (Type=oneshot без RemainAfterExit) — не застосунок, а разова дія під час запуску."""
+    try:
+        t = open(path, errors="replace").read()
+    except OSError:
+        return False
+    return bool(re.search(r"^\s*Type\s*=\s*oneshot", t, re.M)) and not re.search(r"^\s*RemainAfterExit\s*=\s*(yes|true|1)", t, re.M)
+
+
 def detect():
     rc, out, _ = run(["systemctl", "list-unit-files", "--type=service", "--no-legend", "--plain"])
     files = {line.split()[0]: line.split()[1] for line in out.splitlines() if len(line.split()) >= 2}
@@ -713,7 +789,7 @@ def detect():
         n = os.path.basename(p)
         if os.path.islink(p):
             continue  # псевдоніми (dbus-org.*, sshd, syslog…) і замасковані — не окремі сервіси
-        if n not in units and n != "ha-server-agent.service" and files.get(n) == "enabled":
+        if n not in units and n != "ha-server-agent.service" and files.get(n) == "enabled" and not oneshot_file(p):
             units[n] = ["start", "stop", "restart"]
 
     # pm2: демони «PM2 vX: God Daemon (/home/u/.pm2)»

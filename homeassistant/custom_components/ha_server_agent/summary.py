@@ -18,6 +18,8 @@ def problems(mods: dict) -> list[str]:
     for u in s.get("failed_units") or []:
         out.append(f"збій сервісу {u}")
     for u in (mods.get("systemd") or {}).get("units") or []:
+        if u.get("oneshot") and u.get("result") == "success":
+            continue  # одноразовий сервіс відпрацював і завершився — так і має бути
         if u.get("active") not in ("active", "reloading", "activating") and u.get("enabled") == "enabled" \
                 and u["name"] not in (s.get("failed_units") or []):
             out.append(f"{u['name']}: {u.get('active')}")
