@@ -711,8 +711,8 @@ def detect():
     # Власні сервіси (не з пакетів): /etc/systemd/system/*.service, увімкнені
     for p in glob.glob("/etc/systemd/system/*.service"):
         n = os.path.basename(p)
-        if os.path.islink(p) and os.readlink(p) == "/dev/null":
-            continue
+        if os.path.islink(p):
+            continue  # псевдоніми (dbus-org.*, sshd, syslog…) і замасковані — не окремі сервіси
         if n not in units and n != "ha-server-agent.service" and files.get(n) == "enabled":
             units[n] = ["start", "stop", "restart"]
 
@@ -792,6 +792,11 @@ def merge_policy(old, new):
             cur["enabled"] = True
             changes.append(f"увімкнено {name}")
         if name == "systemd":
+            # прибрати псевдоніми, які старі версії помилково додавали (симлінки в /etc/systemd/system)
+            for u in list((cur.get("units") or {})):
+                if os.path.islink("/etc/systemd/system/" + u) and u.rsplit(".", 1)[0] not in KNOWN_UNITS:
+                    del cur["units"][u]
+                    changes.append(f"прибрано псевдонім {u}")
             for u, acts in (sec.get("units") or {}).items():
                 if u not in (cur.get("units") or {}):
                     cur.setdefault("units", {})[u] = acts
