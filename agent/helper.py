@@ -873,6 +873,9 @@ def merge_policy(old, new):
                 if os.path.islink("/etc/systemd/system/" + u) and u.rsplit(".", 1)[0] not in KNOWN_UNITS:
                     del cur["units"][u]
                     changes.append(f"прибрано псевдонім {u}")
+                elif u.rsplit(".", 1)[0] not in KNOWN_UNITS and oneshot_file("/etc/systemd/system/" + u):
+                    del cur["units"][u]
+                    changes.append(f"прибрано одноразовий {u}")
             for u, acts in (sec.get("units") or {}).items():
                 if u not in (cur.get("units") or {}):
                     cur.setdefault("units", {})[u] = acts
