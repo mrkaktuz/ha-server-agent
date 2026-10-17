@@ -109,7 +109,7 @@ No restart needed.
 | --- | --- | --- |
 | `system` | OS, kernel, uptime, load, updates (total / security), reboot required, failed services | — |
 | `systemd` | Services listed in `units` | per service: `start`, `stop`, `restart`, `reload` |
-| `pm2` | Processes of users in `instances`: status, CPU, memory, restarts, uptime | `start`, `stop`, `restart`, `reload` (+ `pm2 save`) |
+| `pm2` | Processes of users in `instances`: status, CPU, memory, restarts, uptime; **whether pm2 comes back after a reboot** (`pm2-<user>` service, pm2/node paths, `pm2 save`) | `start`, `stop`, `restart`, `reload` (+ `pm2 save`); `autostart` — set up autostart (`allow_autostart: false` to forbid) |
 | `nginx` | Version, state, `nginx -t`, sites and domains | `test`, `reload`, `restart` — only after a successful `nginx -t` |
 | `certs` | Certificates from nginx configs and Let's Encrypt: domain, issuer, days left | — |
 | `duplicati` | Backups (Duplicati 2.1+ API): last success, errors, size | `run` |

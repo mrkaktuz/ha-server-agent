@@ -109,7 +109,7 @@ sudo /opt/ha-server-agent/install.sh --local
 | --- | --- | --- |
 | `system` | ОС, ядро, час роботи, навантаження, оновлення (усього / безпеки), потреба в перезавантаженні, збійні сервіси | — |
 | `systemd` | Сервіси зі списку `units` | для кожного свій: `start`, `stop`, `restart`, `reload` |
-| `pm2` | Процеси користувачів з `instances`: стан, CPU, пам'ять, перезапуски, час роботи | `start`, `stop`, `restart`, `reload` (+ `pm2 save`) |
+| `pm2` | Процеси користувачів з `instances`: стан, CPU, пам'ять, перезапуски, час роботи; **чи підніметься pm2 після перезавантаження** (сервіс `pm2-<user>`, шлях до pm2/node, `pm2 save`) | `start`, `stop`, `restart`, `reload` (+ `pm2 save`); `autostart` — налаштувати автозапуск (`allow_autostart: false` — заборонити) |
 | `nginx` | Версія, стан, `nginx -t`, сайти й домени | `test`, `reload`, `restart` — лише після вдалого `nginx -t` |
 | `certs` | Сертифікати з конфігів nginx і Let's Encrypt: домен, видавець, днів до кінця | — |
 | `duplicati` | Завдання (API Duplicati 2.1+): остання вдала копія, помилки, розмір | `run` |

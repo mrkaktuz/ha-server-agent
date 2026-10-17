@@ -169,6 +169,7 @@ def systemd_units(cfg):
 def collect_systemd(cfg, sec):
     units = systemd_units(cfg)
     res = []
+    pm2_users = None
     for name, acts in units.items():
         rc, out, _ = run(["systemctl", "show", name, "--no-pager",
                           "-p", "Id,Description,LoadState,ActiveState,SubState,UnitFileState,MainPID,"
@@ -185,6 +186,13 @@ def collect_systemd(cfg, sec):
             "memory": int(mem) if mem.isdigit() else None, "actions": acts,
             "oneshot": p.get("Type") == "oneshot" and p.get("RemainAfterExit") != "yes", "result": p.get("Result", ""),
         })
+        m = re.match(r"pm2-(.+)\.service$", name)
+        if m and p.get("ActiveState") == "inactive":
+            if pm2_users is None:
+                pm2_users = pm2_daemon_users()
+            if m.group(1) in pm2_users:
+                res[-1]["state_ok"] = True
+                res[-1]["note"] = "pm2 запущено не через systemd; автозапуск перевіряє модуль pm2"
     return {"units": res}
 
 
@@ -216,9 +224,130 @@ def pm2_list(inst):
     return json.loads(out[start:]) if start >= 0 else []
 
 
+def pm2_home(inst):
+    return inst.get("home") or pwd.getpwnam(inst["user"]).pw_dir + "/.pm2"
+
+
+def pm2_daemon_users():
+    """Користувачі, в яких зараз працює демон pm2 («PM2 vX: God Daemon (…)»)."""
+    users = set()
+    for d in glob.glob("/proc/[0-9]*"):
+        try:
+            cmd = open(d + "/cmdline", "rb").read().replace(b"\0", b" ").decode(errors="replace")
+            if cmd.startswith("PM2") and "God Daemon" in cmd:
+                users.add(user_name(os.stat(d).st_uid))
+        except OSError:
+            continue
+    return users
+
+
+def pm2_autostart(inst, apps):
+    """Чи підніметься pm2 після перезавантаження: сервіс pm2-<user> є й увімкнений, pm2 і node з нього існують,
+    поточні процеси збережено (pm2 save)."""
+    user, home = inst["user"], pm2_home(inst)
+    unit = f"pm2-{user}.service"
+    rc, out, _ = run(["systemctl", "show", unit, "--no-pager", "-p", "LoadState,UnitFileState,ActiveState,ExecStart,Environment,User"])
+    p = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+    issues = []
+    if p.get("LoadState") != "loaded":
+        issues.append("немає сервісу автозапуску (pm2 startup)")
+    else:
+        if p.get("UnitFileState") not in ("enabled", "enabled-runtime"):
+            issues.append(f"сервіс {unit} вимкнений ({p.get('UnitFileState') or '?'})")
+        m = re.search(r"path=(\S+)", p.get("ExecStart", ""))
+        if m and not os.path.exists(m.group(1)):
+            issues.append(f"сервіс запускає pm2, якого вже немає: {m.group(1)}")
+        env = dict(x.split("=", 1) for x in p.get("Environment", "").split() if "=" in x)
+        dirs = [d for d in env.get("PATH", "").split(":") if d]
+        if dirs and not any(os.path.exists(os.path.join(d, "node")) for d in dirs):
+            issues.append("у PATH сервісу немає node (мабуть, версію з nvm видалено)")
+        if env.get("PM2_HOME") and os.path.realpath(env["PM2_HOME"]) != os.path.realpath(home):
+            issues.append(f"сервіс використовує інший PM2_HOME: {env['PM2_HOME']}")
+        if (p.get("User") or "root") != user:
+            issues.append(f"сервіс запускається від іншого користувача: {p.get('User') or 'root'}")
+    saved = None
+    try:
+        saved = [a.get("name") for a in json.load(open(os.path.join(home, "dump.pm2")))]
+    except FileNotFoundError:
+        if apps:
+            issues.append("список процесів не збережено (pm2 save)")
+    except (OSError, ValueError):
+        issues.append("файл dump.pm2 пошкоджений")
+    if saved is not None:
+        miss = [a["name"] for a in apps if a["name"] not in saved]
+        if miss:
+            issues.append("не збережено (pm2 save): " + ", ".join(miss))
+    return {"unit": unit, "unit_enabled": p.get("UnitFileState"), "unit_active": p.get("ActiveState"),
+            "saved": saved, "issues": issues, "ok": not issues}
+
+
+PM2_UNIT = """[Unit]
+Description=PM2 process manager (ha-server-agent)
+Documentation=https://pm2.keymetrics.io/
+After=network.target
+
+[Service]
+Type=forking
+User={user}
+LimitNOFILE=infinity
+LimitNPROC=infinity
+LimitCORE=infinity
+Environment=PATH={path}
+Environment=PM2_HOME={home}
+PIDFile={home}/pm2.pid
+Restart=on-failure
+
+ExecStart={pm2} resurrect
+ExecReload={pm2} reload all
+ExecStop={pm2} kill
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def act_pm2_autostart(cfg, user):
+    """Налаштувати автозапуск pm2 так само, як «pm2 startup» + «pm2 save», але без запуску другого демона:
+    сервіс записується й вмикається, поточний демон не чіпається — systemd підхопить pm2 після перезавантаження."""
+    if not cfg.get("allow_autostart", True):
+        raise Denied("pm2: налаштування автозапуску вимкнено в policy.yaml")
+    inst = next((i for i in cfg.get("instances") or [] if i["user"] == user), None)
+    if not inst:
+        raise Denied(f"pm2: немає користувача {user}")
+    home, pm2 = pm2_home(inst), os.path.realpath(inst["pm2"])
+    log = []
+    rc, out, err = run([inst["pm2"], "save"], user=user, env=pm2_env(inst), timeout=60)
+    log.append("pm2 save: " + ("ok" if rc == 0 else tail(out + err, 200)))
+    if rc != 0:
+        return {"ok": False, "output": "\n".join(log)}
+    unit = f"/etc/systemd/system/pm2-{user}.service"
+    if os.path.exists(unit):
+        shutil.copy(unit, unit + ".bak")
+        log.append(f"старий сервіс збережено: {unit}.bak")
+    node_dir = os.path.dirname(os.path.realpath(shutil.which("node", path=os.path.dirname(inst["pm2"]) + ":" + ENV["PATH"]) or "/usr/bin/node"))
+    with open(unit, "w") as f:
+        f.write(PM2_UNIT.format(user=user, home=home, pm2=pm2, path=":".join(dict.fromkeys([os.path.dirname(inst["pm2"]), node_dir] + ENV["PATH"].split(":")))))
+    os.chmod(unit, 0o644)
+    for argv in (["systemctl", "daemon-reload"], ["systemctl", "enable", f"pm2-{user}.service"]):
+        rc, out, err = run(argv, timeout=60)
+        log.append(" ".join(argv[1:]) + ": " + ("ok" if rc == 0 else tail(out + err, 200)))
+        if rc != 0:
+            return {"ok": False, "output": "\n".join(log)}
+    a = pm2_autostart(inst, [{"name": n} for n in (pm2_list_names(inst))])
+    log.append("перевірка: " + ("ок — pm2 підніметься після перезавантаження" if a["ok"] else "; ".join(a["issues"])))
+    return {"ok": a["ok"], "output": "\n".join(log)}
+
+
+def pm2_list_names(inst):
+    try:
+        return [a.get("name") for a in pm2_list(inst)]
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def collect_pm2(cfg, sec):
     acts = [a for a in (cfg.get("actions") or ["restart"]) if a in PM2_ACTIONS]
-    res = []
+    res, warnings = [], []
     for inst in cfg.get("instances") or []:
         item = {"user": inst["user"], "apps": []}
         try:
@@ -235,11 +364,19 @@ def collect_pm2(cfg, sec):
                 })
         except Exception as e:  # noqa: BLE001
             item["error"] = str(e)
+        if "error" not in item:
+            item["autostart"] = pm2_autostart(inst, item["apps"])
+            if cfg.get("allow_autostart", True):
+                item["autostart"]["actions"] = ["autostart"]
+            for i in item["autostart"]["issues"]:
+                warnings.append(f"pm2 ({inst['user']}) після перезавантаження: {i}")
         res.append(item)
-    return {"instances": res}
+    return {"instances": res, "warnings": warnings}
 
 
 def act_pm2(cfg, target, action):
+    if action == "autostart":
+        return act_pm2_autostart(cfg, target)
     acts = [a for a in (cfg.get("actions") or ["restart"]) if a in PM2_ACTIONS]
     if action not in acts or "/" not in target:
         raise Denied(f"pm2: {action} не дозволено")

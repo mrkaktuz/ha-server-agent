@@ -18,8 +18,8 @@ def problems(mods: dict) -> list[str]:
     for u in s.get("failed_units") or []:
         out.append(f"збій сервісу {u}")
     for u in (mods.get("systemd") or {}).get("units") or []:
-        if u.get("oneshot") and u.get("result") == "success":
-            continue  # одноразовий сервіс відпрацював і завершився — так і має бути
+        if u.get("state_ok") or (u.get("oneshot") and u.get("result") == "success"):
+            continue  # агент знає, що такий стан — норма (напр. одноразовий сервіс відпрацював)
         if u.get("active") not in ("active", "reloading", "activating") and u.get("enabled") == "enabled" \
                 and u["name"] not in (s.get("failed_units") or []):
             out.append(f"{u['name']}: {u.get('active')}")
@@ -49,6 +49,9 @@ def problems(mods: dict) -> list[str]:
             out.append(f"Duplicati «{b.get('name')}»: помилка")
         elif ls and (datetime.now(timezone.utc) - ls).days > 2:
             out.append(f"Duplicati «{b.get('name')}»: копії не було {(datetime.now(timezone.utc) - ls).days} дн")
+    for m in mods.values():
+        if isinstance(m, dict):
+            out.extend(str(w)[:120] for w in m.get("warnings") or [])  # нові перевірки агента — без оновлення HA
     for name, m in mods.items():
         if isinstance(m, dict) and m.get("error") and name not in ("duplicati",):
             out.append(f"модуль {name}: {str(m['error'])[:80]}")
