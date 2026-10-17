@@ -76,6 +76,9 @@ def cached(name, ttl, fn):
     try:
         with open(path, "w") as f:
             json.dump(data, f)
+        if data is None and ttl > 600:  # не вдалося — повторити через 10 хв, а не через ttl
+            t = time.time() - ttl + 600
+            os.utime(path, (t, t))
     except OSError:
         pass
     return data

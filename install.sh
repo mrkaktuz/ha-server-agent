@@ -110,6 +110,7 @@ cat > /usr/local/bin/$NAME <<EOF
 exec /usr/bin/python3 -I $LIB/cli.py "\$@"
 EOF
 chmod 755 /usr/local/bin/$NAME
+rm -f /var/cache/$NAME/*.json  # нова версія — свіжі перевірки (apt, сертифікати, nginx -t)
 install -d -o root -g $USR -m 750 "$ETC"
 install -d -o $USR -g $USR -m 700 "$ETC/state"
 install -d -o $USR -g $USR -m 750 "$LOG"
