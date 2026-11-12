@@ -836,6 +836,7 @@ def act_agent(cfg, target, action):
 CLAUDE_UA = "ha-server-agent"
 CLAUDE_DIST_TAGS = "https://registry.npmjs.org/-/package/@anthropic-ai/claude-code/dist-tags"
 CLAUDE_USAGE = "https://api.anthropic.com/api/oauth/usage"
+CLAUDE_PROFILE = "https://api.anthropic.com/api/oauth/profile"
 
 
 def claude_users(cfg):
@@ -905,16 +906,29 @@ def claude_usage(user, home, cfg):
         cred = json.load(open(os.path.join(home, ".claude", ".credentials.json"))).get("claudeAiOauth") or {}
     except (OSError, ValueError):
         return dict(last or {}, error="немає входу в Claude (.credentials.json)")
-    plan = {"subscription": cred.get("subscriptionType"), "tier": cred.get("rateLimitTier")}
+    # План — з профілю акаунта (раз на 6 год): subscriptionType у .credentials.json лишається таким, як був під час входу
+    plan = {k: (last or {}).get(k) for k in ("subscription", "tier", "_pt")}
+    if not plan["subscription"]:
+        plan.update(subscription=cred.get("subscriptionType"), tier=cred.get("rateLimitTier"))
     if not cred.get("accessToken") or (cred.get("expiresAt") or 0) / 1000 < time.time() + 60:
         return dict(last or {}, **plan, stale=True)
-    req = urllib.request.Request(CLAUDE_USAGE, headers={"Authorization": "Bearer " + cred["accessToken"],
-                                                        "anthropic-beta": "oauth-2025-04-20", "User-Agent": CLAUDE_UA})
-    try:
+
+    def get(url):
+        req = urllib.request.Request(url, headers={"Authorization": "Bearer " + cred["accessToken"],
+                                                   "anthropic-beta": "oauth-2025-04-20", "User-Agent": CLAUDE_UA})
         with urllib.request.urlopen(req, timeout=15) as r:
-            d = json.load(r)
+            return json.load(r)
+    try:
+        d = get(CLAUDE_USAGE)
     except (urllib.error.URLError, OSError, ValueError) as e:
         return dict(last or {}, **plan, stale=True, error=f"ліміти: {e}"[:160])
+    if time.time() - (plan.get("_pt") or 0) > 6 * 3600:
+        try:
+            org = get(CLAUDE_PROFILE).get("organization") or {}
+            plan.update(subscription=(org.get("organization_type") or "").replace("claude_", "") or plan["subscription"],
+                        tier=org.get("rate_limit_tier") or plan["tier"], _pt=time.time())
+        except (urllib.error.URLError, OSError, ValueError, AttributeError):
+            pass
     limits = []
     for x in d.get("limits") or []:
         scope = ((x.get("scope") or {}).get("model") or {}).get("display_name")
@@ -962,7 +976,7 @@ def collect_claude(cfg, sec):
                 "rc": [{"name": x["name"], "version": x["version"], "since": x["since"]} for x in rc],
                 "rc_sessions": sum(1 for x in p if x["kind"] == "rc_session"), "cli": sum(1 for x in p if x["kind"] == "cli")}
         if cfg.get("usage", True):
-            info["usage"] = {k: v for k, v in claude_usage(u, home, cfg).items() if k != "_t"}
+            info["usage"] = {k: v for k, v in claude_usage(u, home, cfg).items() if not k.startswith("_")}
         users.append(info)
     units = [claude_unit_state(x) for x in cfg.get("units") or [] if re.match(r"^[\w@.-]+\.service$", x)]
     for x in units:
