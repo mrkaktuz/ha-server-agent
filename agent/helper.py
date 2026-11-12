@@ -231,6 +231,27 @@ def pm2_home(inst):
     return inst.get("home") or pwd.getpwnam(inst["user"]).pw_dir + "/.pm2"
 
 
+def pm2_unit_home(user):
+    """PM2_HOME із сервісу автозапуску pm2-<user> — саме цей демон підніметься після перезавантаження."""
+    rc, out, _ = run(["systemctl", "show", f"pm2-{user}.service", "-p", "LoadState", "-p", "Environment"])
+    p = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+    if p.get("LoadState") != "loaded":
+        return None
+    env = dict(x.split("=", 1) for x in p.get("Environment", "").split() if "=" in x)
+    return env.get("PM2_HOME")
+
+
+def pm2_running(home):
+    """Чи працює демон pm2 цього PM2_HOME. Перевіряємо до pm2 jlist: jlist без демона сам його запускає
+    (так на dev з'являвся порожній демон у /tmp/.pm2)."""
+    try:
+        pid = int(open(os.path.join(home, "pm2.pid")).read().strip())
+        cmd = open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\0", b" ").decode(errors="replace")
+    except (OSError, ValueError):
+        return False
+    return "God Daemon" in cmd
+
+
 def pm2_daemon_users():
     """Користувачі, в яких зараз працює демон pm2 («PM2 vX: God Daemon (…)»)."""
     users = set()
@@ -354,6 +375,8 @@ def collect_pm2(cfg, sec):
     for inst in cfg.get("instances") or []:
         item = {"user": inst["user"], "apps": []}
         try:
+            if not pm2_running(pm2_home(inst)):
+                raise RuntimeError(f"pm2 не запущений (немає демона в {pm2_home(inst)})")
             for a in pm2_list(inst):
                 env = a.get("pm2_env") or {}
                 mon = a.get("monit") or {}
@@ -1111,7 +1134,8 @@ def detect():
         cand = ([os.path.join(os.path.dirname(exe), "pm2")] if exe else []) + ["/usr/local/bin/pm2", "/usr/bin/pm2"]
         binp = next((c for c in cand if os.path.exists(c)), None)
         if binp:
-            pm2.append({"user": user, "pm2": binp, "home": home.group(1) if home else None})
+            # Справжній — той, що піднімає сервіс автозапуску; демонів може бути кілька (напр. випадковий у /tmp)
+            pm2.append({"user": user, "pm2": binp, "home": pm2_unit_home(user) or (home.group(1) if home else None)})
 
     # Claude Code: користувачі, що в нього увійшли; сервіси, які його запускають (claude-rc тощо)
     claude = sorted({os.path.basename(os.path.dirname(os.path.dirname(c))) for c in glob.glob("/home/*/.claude/.credentials.json")}
@@ -1186,6 +1210,11 @@ def merge_policy(old, new):
                     cur.setdefault("units", {})[u] = acts
                     changes.append(f"сервіс {u}")
         elif name == "pm2":
+            for i in cur.get("instances") or []:
+                uh = pm2_unit_home(i["user"])
+                if uh and os.path.realpath(uh) != os.path.realpath(pm2_home(i)):
+                    changes.append(f"pm2 {i['user']}: PM2_HOME {pm2_home(i)} → {uh} (як у pm2-{i['user']}.service)")
+                    i["home"] = uh
             have = {i["user"] for i in cur.get("instances") or []}
             for i in sec.get("instances") or []:
                 if i["user"] not in have:
