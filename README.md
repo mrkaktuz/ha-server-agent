@@ -96,6 +96,9 @@ Disable: `agent: {allow_update: false}` in `policy.yaml`.
 | Audit | Every action and pairing → `/var/log/ha-server-agent/audit.log` |
 
 By design the agent **cannot** run arbitrary commands, read files or change configs.
+The one exception is the `claude` module with `usage: true`: it reads the Claude Code login token (`~/.claude/.credentials.json`)
+to ask `api.anthropic.com` for the limits (the same request as `/usage`). The token goes nowhere else and is never part of the
+agent's response; an expired token is not refreshed by the agent — Claude Code does that itself. `usage: false` turns it off.
 
 ## Secrets
 
@@ -117,6 +120,7 @@ No restart needed.
 | `docker` | Containers | `start`, `stop`, `restart` (`containers: []` = any, otherwise only listed) |
 | `fail2ban` | Jails: banned now / total | — |
 | `processes` | Top 5 processes by CPU and memory | — |
+| `claude` | Claude Code of users in `users`: installed and latest version (npm, channel from `~/.claude.json`), Remote Control and its sessions, services in `units` (e.g. `claude-rc`); with `usage: true` — subscription limits (5 h, week, week per model), at most once per `usage_minutes` | — |
 | `agent` | Version, commit, newer commit on GitHub | `update`, `check` |
 
 ## Commands on the server

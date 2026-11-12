@@ -96,6 +96,9 @@ sudo /opt/ha-server-agent/install.sh --local
 | Журнал | Кожна дія й сполучення → `/var/log/ha-server-agent/audit.log` |
 
 Агент навмисно **не вміє** виконувати довільні команди, читати файли чи змінювати конфіги.
+Єдиний виняток — модуль `claude` з `usage: true`: він читає токен входу Claude Code (`~/.claude/.credentials.json`),
+щоб спитати ліміти в `api.anthropic.com` (той самий запит, що й `/usage`). Токен нікуди більше не йде й у відповідь
+агента не потрапляє; прострочений токен агент не оновлює — це робить сам Claude Code. `usage: false` — вимкнути.
 
 ## Секрети
 
@@ -117,6 +120,7 @@ sudo /opt/ha-server-agent/install.sh --local
 | `docker` | Контейнери | `start`, `stop`, `restart` (`containers: []` — будь-які, інакше лише перелічені) |
 | `fail2ban` | Jail-и: заблоковано зараз / усього | — |
 | `processes` | Топ-5 процесів за CPU і пам'яттю | — |
+| `claude` | Claude Code користувачів з `users`: встановлена й найновіша версія (npm, канал з `~/.claude.json`), Remote Control і його сесії, сервіси з `units` (напр. `claude-rc`); з `usage: true` — ліміти підписки (5 год, тиждень, тиждень за моделлю), не частіше ніж раз на `usage_minutes` | — |
 | `agent` | Версія, коміт, новіший коміт на GitHub | `update`, `check` |
 
 ## Команди на сервері

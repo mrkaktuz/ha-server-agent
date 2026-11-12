@@ -831,12 +831,156 @@ def act_agent(cfg, target, action):
     return {"ok": True, "output": "Оновлення запущено (журнал: " + log + ")"}
 
 
+# --------------------------------------------------------------------------- claude
+
+CLAUDE_UA = "ha-server-agent"
+CLAUDE_DIST_TAGS = "https://registry.npmjs.org/-/package/@anthropic-ai/claude-code/dist-tags"
+CLAUDE_USAGE = "https://api.anthropic.com/api/oauth/usage"
+
+
+def claude_users(cfg):
+    return [u for u in cfg.get("users") or [] if re.match(r"^[a-z_][a-z0-9_-]*$", u)]
+
+
+def claude_home(user):
+    try:
+        return pwd.getpwnam(user).pw_dir
+    except KeyError:
+        return None
+
+
+def claude_version_of(path):
+    m = re.search(r"/claude/versions/(\d+\.\d+\.\d+)", path or "")
+    return m.group(1) if m else None
+
+
+def proc_start(d):
+    """Час запуску процесу (з /proc/<pid>/stat і часу завантаження)."""
+    stat = open(d + "/stat").read()
+    ticks = int(stat.rsplit(")", 1)[1].split()[19])
+    btime = next(int(line.split()[1]) for line in open("/proc/stat") if line.startswith("btime "))
+    return btime + ticks / os.sysconf("SC_CLK_TCK")
+
+
+def claude_procs():
+    """Процеси Claude Code за користувачами: Remote Control, його сесії, звичайні (у терміналі / tmux)."""
+    res = {}
+    for d in glob.glob("/proc/[0-9]*"):
+        try:
+            exe = os.readlink(d + "/exe")
+            if "/claude/versions/" not in exe:
+                continue
+            cmd = open(d + "/cmdline", "rb").read().split(b"\0")
+            uid = os.stat(d).st_uid
+            start = proc_start(d)
+        except OSError:
+            continue
+        args = [a.decode(errors="replace") for a in cmd if a]
+        kind = "rc" if "remote-control" in args else "rc_session" if "--sdk-url" in args else "cli"
+        name = None
+        if kind == "rc" and "--name" in args[:-1]:
+            name = args[args.index("--name") + 1]
+        res.setdefault(user_name(uid), []).append({"kind": kind, "version": claude_version_of(exe.replace(" (deleted)", "")),
+                                                   "name": name, "since": iso(start)})
+    return res
+
+
+def claude_unit_state(unit):
+    rc, out, _ = run(["systemctl", "show", unit, "-p", "ActiveState", "-p", "UnitFileState", "-p", "ActiveEnterTimestamp"])
+    p = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+    return {"unit": unit, "active": p.get("ActiveState"), "enabled": p.get("UnitFileState"), "since": p.get("ActiveEnterTimestamp") or None}
+
+
+def claude_usage(user, home, cfg):
+    """Ліміти підписки — той самий запит, що й /usage у Claude Code. Токен лише читається й іде тільки на api.anthropic.com;
+    у відповідь агента він не потрапляє. Простроченого токена агент не оновлює (це зробить сам Claude) — віддає останні дані."""
+    path = os.path.join(CACHE, f"claude_usage_{user}.json")
+    try:
+        last = json.load(open(path))
+    except (OSError, ValueError):
+        last = None
+    if last and time.time() - last.get("_t", 0) < int(cfg.get("usage_minutes", 5)) * 60:
+        return last
+    try:
+        cred = json.load(open(os.path.join(home, ".claude", ".credentials.json"))).get("claudeAiOauth") or {}
+    except (OSError, ValueError):
+        return dict(last or {}, error="немає входу в Claude (.credentials.json)")
+    plan = {"subscription": cred.get("subscriptionType"), "tier": cred.get("rateLimitTier")}
+    if not cred.get("accessToken") or (cred.get("expiresAt") or 0) / 1000 < time.time() + 60:
+        return dict(last or {}, **plan, stale=True)
+    req = urllib.request.Request(CLAUDE_USAGE, headers={"Authorization": "Bearer " + cred["accessToken"],
+                                                        "anthropic-beta": "oauth-2025-04-20", "User-Agent": CLAUDE_UA})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            d = json.load(r)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return dict(last or {}, **plan, stale=True, error=f"ліміти: {e}"[:160])
+    limits = []
+    for x in d.get("limits") or []:
+        scope = ((x.get("scope") or {}).get("model") or {}).get("display_name")
+        limits.append({"kind": x.get("kind"), "group": x.get("group"), "percent": x.get("percent"), "severity": x.get("severity"),
+                       "resets_at": x.get("resets_at"), "model": scope, "active": x.get("is_active")})
+    ex = d.get("extra_usage") or {}
+    out = dict(plan, limits=limits, extra_usage=bool(ex.get("is_enabled")), _t=time.time(), checked=iso(time.time()))
+    try:
+        os.makedirs(CACHE, mode=0o700, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(out, f)
+    except OSError:
+        pass
+    return out
+
+
+def collect_claude(cfg, sec):
+    def dist_tags():
+        try:
+            req = urllib.request.Request(CLAUDE_DIST_TAGS, headers={"User-Agent": CLAUDE_UA})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return json.load(r)
+        except (urllib.error.URLError, OSError, ValueError):
+            return None  # cached() повторить за 10 хв
+    tags = cached("claude_dist_tags", 6 * 3600, dist_tags)
+    procs = claude_procs()
+    users, warnings = [], []
+    for u in claude_users(cfg):
+        home = claude_home(u)
+        if not home:
+            continue
+        link = os.path.join(home, ".local", "bin", "claude")
+        installed = claude_version_of(os.path.realpath(link)) if os.path.exists(link) else None
+        try:
+            conf = json.load(open(os.path.join(home, ".claude.json")))
+        except (OSError, ValueError):
+            conf = {}
+        channel = conf.get("autoUpdatesChannel") or "latest"
+        latest = (tags or {}).get(channel)
+        p = procs.get(u, [])
+        rc = [x for x in p if x["kind"] == "rc"]
+        info = {"user": u, "installed": installed, "latest": latest, "channel": channel,
+                "update_available": bool(installed and latest and installed != latest),
+                "auto_updates": conf.get("autoUpdates"), "install_method": conf.get("installMethod"),
+                "rc": [{"name": x["name"], "version": x["version"], "since": x["since"]} for x in rc],
+                "rc_sessions": sum(1 for x in p if x["kind"] == "rc_session"), "cli": sum(1 for x in p if x["kind"] == "cli")}
+        if cfg.get("usage", True):
+            info["usage"] = {k: v for k, v in claude_usage(u, home, cfg).items() if k != "_t"}
+        users.append(info)
+    units = [claude_unit_state(x) for x in cfg.get("units") or [] if re.match(r"^[\w@.-]+\.service$", x)]
+    for x in units:
+        if x["enabled"] == "enabled" and x["active"] != "active":
+            warnings.append(f"Claude: {x['unit']} — {x['active']}")
+    for i in users:
+        old = sorted({r["version"] for r in i["rc"] if r["version"] and i["installed"] and r["version"] != i["installed"]})
+        if old:
+            i["rc_outdated"] = old  # Remote Control працює на версії, з якої вже оновились, — до перезапуску
+    return {"users": users, "units": units, "warnings": warnings}
+
+
 # --------------------------------------------------------------------------- диспетчер
 
 MODULES = {
     "system": collect_system, "systemd": collect_systemd, "pm2": collect_pm2, "nginx": collect_nginx,
     "certs": collect_certs, "duplicati": collect_duplicati, "tmux": collect_tmux, "docker": collect_docker,
-    "fail2ban": collect_fail2ban, "processes": collect_processes, "agent": collect_agent,
+    "fail2ban": collect_fail2ban, "processes": collect_processes, "claude": collect_claude, "agent": collect_agent,
 }
 
 
@@ -955,6 +1099,12 @@ def detect():
         if binp:
             pm2.append({"user": user, "pm2": binp, "home": home.group(1) if home else None})
 
+    # Claude Code: користувачі, що в нього увійшли; сервіси, які його запускають (claude-rc тощо)
+    claude = sorted({os.path.basename(os.path.dirname(os.path.dirname(c))) for c in glob.glob("/home/*/.claude/.credentials.json")}
+                    | ({"root"} if os.path.exists("/root/.claude/.credentials.json") else set()))
+    claude_units = sorted(os.path.basename(p) for p in glob.glob("/etc/systemd/system/*.service")
+                          if not os.path.islink(p) and re.search(r"^\s*ExecStart\s*=.*\bclaude\b", open(p, errors="replace").read(), re.M))
+
     # tmux: користувачі з відкритим сервером tmux
     tmux = sorted({user_name(os.stat(s).st_uid) for s in glob.glob("/tmp/tmux-*/*")})
 
@@ -984,6 +1134,7 @@ def detect():
         "docker": {"enabled": has_docker, "actions": ["start", "stop", "restart"], "containers": []},
         "fail2ban": {"enabled": bool(shutil.which("fail2ban-client", path=ENV["PATH"]))},
         "processes": {"enabled": True, "top": 5},
+        "claude": {"enabled": bool(claude), "users": claude, "units": claude_units, "usage": True, "usage_minutes": 5},
         "agent": {"enabled": True, "allow_update": True, "check_hours": 3},
     }
     found = {"pm2": [i["user"] for i in pm2], "tmux": tmux, "duplicati": dup_unit or dup_docker,
@@ -1026,11 +1177,15 @@ def merge_policy(old, new):
                 if i["user"] not in have:
                     cur.setdefault("instances", []).append(i)
                     changes.append(f"pm2 {i['user']}")
-        elif name == "tmux":
+        elif name in ("tmux", "claude"):
             for u in sec.get("users") or []:
                 if u not in (cur.get("users") or []):
                     cur.setdefault("users", []).append(u)
-                    changes.append(f"tmux {u}")
+                    changes.append(f"{name} {u}")
+            for x in sec.get("units") or [] if name == "claude" else []:
+                if x not in (cur.get("units") or []):
+                    cur.setdefault("units", []).append(x)
+                    changes.append(f"claude {x}")
         elif name == "duplicati" and sec.get("url") and cur.get("url") in (None, "http://127.0.0.1:8200") and sec["url"] != cur.get("url"):
             cur["url"] = sec["url"]
             changes.append(f"Duplicati {sec['url']}")
